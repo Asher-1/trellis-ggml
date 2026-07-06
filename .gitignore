@@ -42,7 +42,6 @@ crash-*
 # fuzzing
 /corpus_*/
 crash-*
-/fuzz/crashes-fixed/
 
 # demo server build artifacts
 /server/trellis2-server
