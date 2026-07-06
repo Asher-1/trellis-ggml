@@ -28,6 +28,14 @@ int main(int argc, char ** argv) {
     }
     const std::string gguf_path = argv[1];
     const std::string ref_path  = argv[2];
+
+    {
+        std::ifstream _a(gguf_path), _b(ref_path);
+        if (!_a.good() || !_b.good()) {
+            std::fprintf(stderr, "missing input file(s), skipping\n");
+            return 77;
+        }
+    }
     const double rel_tol = (argc > 3) ? std::atof(argv[3]) : 2e-3;
 
     // ── read the reference bundle ────────────────────────────────────────────

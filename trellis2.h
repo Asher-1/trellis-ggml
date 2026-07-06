@@ -146,7 +146,8 @@ TRELLIS2_API const char * trellis2_version(void);
 TRELLIS2_API trellis2_ss_flow_model *
 trellis2_ss_flow_load(const std::string & path,
                       bool load_tensors = true,
-                      std::string * error = nullptr);
+                      std::string * error = nullptr,
+                      const char * device = nullptr);
 
 TRELLIS2_API void trellis2_ss_flow_free(trellis2_ss_flow_model * m);
 
@@ -176,6 +177,10 @@ struct trellis2_ss_sampler_params {
     float    sigma_min             = 1e-5f;
     uint64_t seed                  = 0;     // used only when noise is generated internally
     bool     verbose               = true;  // print per-step progress to stderr
+
+    // Optional per-step progress callback (called after each Euler step).
+    void   (*progress)(void * user, int step, int total) = nullptr;
+    void   * progress_user         = nullptr;
 };
 
 // Run one forward pass of the SS-flow DiT (CPU backend), i.e. the velocity
@@ -253,7 +258,8 @@ struct trellis2_ss_dec_model;
 TRELLIS2_API trellis2_ss_dec_model *
 trellis2_ss_dec_load(const std::string & path,
                      bool load_tensors = true,
-                     std::string * error = nullptr);
+                     std::string * error = nullptr,
+                     const char * device = nullptr);
 
 TRELLIS2_API void trellis2_ss_dec_free(trellis2_ss_dec_model * m);
 
@@ -282,6 +288,232 @@ trellis2_ss_dec_decode(trellis2_ss_dec_model * m,
                        float * out, std::string * error = nullptr);
 
 /*****************************************************************************
+** Public API – Shape-SLAT flow DiT (stage 2, fine geometry)
+**
+** SLatFlowModel: the same 1.3B DiT block structure as the SS-flow model, but
+** sparse — tokens are the active voxels of the 32^3 scaffold produced by the
+** SS stage, with 3D RoPE over each voxel's integer coordinates. In/out are
+** 32-channel per-voxel structured latents.
+*****************************************************************************/
+
+struct trellis2_slat_flow_hparams {
+    int32_t resolution     = 0;   // 32 for the 512 model
+    int32_t in_channels    = 0;   // 32
+    int32_t out_channels   = 0;   // 32
+    int32_t model_channels = 0;   // 1536
+    int32_t cond_channels  = 0;   // 1024
+    int32_t num_blocks     = 0;   // 30
+    int32_t num_heads      = 0;   // 12
+    float   mlp_ratio      = 0.0f;
+    int32_t share_mod         = 0;
+    int32_t qk_rms_norm       = 0;
+    int32_t qk_rms_norm_cross = 0;
+    float   rope_freq_min  = 1.0f;
+    float   rope_freq_base = 10000.0f;
+    char    pe_mode[16]    = {0};
+    int32_t file_type      = 0;
+
+    // shape_slat_normalization (pipeline.json), baked in by the converter:
+    // decoder input = sampler output * std + mean.
+    float   norm_mean[64]  = {0};
+    float   norm_std[64]   = {0};
+
+    int32_t head_dim() const { return num_heads ? model_channels / num_heads : 0; }
+};
+
+struct trellis2_slat_flow_model;
+
+TRELLIS2_API trellis2_slat_flow_model *
+trellis2_slat_flow_load(const std::string & path,
+                        bool load_tensors = true,
+                        std::string * error = nullptr,
+                        const char * device = nullptr);
+
+TRELLIS2_API void trellis2_slat_flow_free(trellis2_slat_flow_model * m);
+TRELLIS2_API const char * trellis2_slat_flow_backend_name(const trellis2_slat_flow_model * m);
+TRELLIS2_API const trellis2_slat_flow_hparams &
+trellis2_slat_flow_hparams_of(const trellis2_slat_flow_model * m);
+
+// One forward pass v = model(x, t, cond) over L active voxels.
+//   x      : [L * in_channels] floats, voxel-major (x[v*C + c])
+//   coords : [L * 3] int32 voxel coordinates (c1, c2, c3) in [0, resolution)
+//   cond   : [cond_tokens * cond_channels], token-major (.dinodata layout)
+//   out    : [L * out_channels], voxel-major
+TRELLIS2_API bool
+trellis2_slat_flow_forward(trellis2_slat_flow_model * m,
+                           const float * x, int n_voxels, const int32_t * coords,
+                           float t,
+                           const float * cond, int cond_tokens, int cond_channels,
+                           float * out, std::string * error = nullptr);
+
+// Full flow-Euler sampling (CFG + interval + rescale) over the voxel set.
+// Defaults for the shape stage differ from the SS stage: guidance_rescale 0.5,
+// rescale_t 3.0 (set them in `params`; steps 12 / strength 7.5 are shared).
+// When denormalize is true the output is sampler_output * std + mean, ready
+// for the shape decoder.
+TRELLIS2_API bool
+trellis2_slat_flow_sample(trellis2_slat_flow_model * m,
+                          int n_voxels, const int32_t * coords,
+                          const float * cond, int cond_tokens, int cond_channels,
+                          const trellis2_ss_sampler_params * params,
+                          const float * noise, bool denormalize,
+                          float * out_latent, std::string * error = nullptr);
+
+/*****************************************************************************
+** Public API – Shape-SLAT VAE decoder (FlexiDualGridVaeDecoder)
+**
+** Sparse ConvNeXt U-Net decoder: 32-channel latent on the 32^3 voxel set ->
+** 7 channels per active voxel at 16x resolution (512^3). The subdivision at
+** each of the 4 upsampling steps is predicted by the network, so the active
+** set grows adaptively. Output channels: [0:3] dual-vertex offset logits
+** (sigmoid+margin applied by the mesher), [3:6] per-axis intersection logits,
+** [6] quad split weight (softplus applied by the mesher).
+*****************************************************************************/
+
+struct trellis2_shape_dec_hparams {
+    int32_t latent_channels = 0;    // 32
+    int32_t out_channels    = 0;    // 7
+    int32_t n_levels        = 0;    // 5
+    int32_t channels[8]     = {0};  // [1024, 512, 256, 128, 64]
+    int32_t num_blocks[8]   = {0};  // [4, 16, 8, 4, 0]
+    float   norm_eps        = 1e-6f;
+    float   voxel_margin    = 0.5f;
+    int32_t file_type       = 0;
+
+    int32_t upscale() const { int u = 1; for (int i = 1; i < n_levels; ++i) u *= 2; return u; }
+};
+
+struct trellis2_shape_dec_model;
+
+TRELLIS2_API trellis2_shape_dec_model *
+trellis2_shape_dec_load(const std::string & path,
+                        bool load_tensors = true,
+                        std::string * error = nullptr,
+                        const char * device = nullptr);
+
+TRELLIS2_API void trellis2_shape_dec_free(trellis2_shape_dec_model * m);
+TRELLIS2_API const char * trellis2_shape_dec_backend_name(const trellis2_shape_dec_model * m);
+TRELLIS2_API const trellis2_shape_dec_hparams &
+trellis2_shape_dec_hparams_of(const trellis2_shape_dec_model * m);
+
+// Optional per-level activation taps for validation (names match
+// scripts/dump_slat_reference.py: "lvl{i}.pre_up", "lvl{i}.subdiv",
+// "lvl{i}.in_coords", "out7", "out_coords").
+struct trellis2_shape_dec_taps {
+    std::vector<std::string>        names;
+    std::vector<std::vector<float>> data;
+};
+
+// Decode the (denormalized) structured latent into per-voxel dual-grid fields.
+//   slat       : [L * latent_channels] floats, voxel-major
+//   coords     : [L * 3] int32 at the input resolution (32^3 scaffold)
+//   out_feats  : filled with [L_out * out_channels] floats, voxel-major
+//   out_coords : filled with [L_out * 3] int32 at input_res * upscale()
+TRELLIS2_API bool
+trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
+                          const float * slat, int n_voxels, const int32_t * coords,
+                          std::vector<float> & out_feats,
+                          std::vector<int32_t> & out_coords,
+                          trellis2_shape_dec_taps * taps = nullptr,
+                          std::string * error = nullptr);
+
+/*****************************************************************************
+** Public API – DINOv3 ViT-L/16 image-conditioning encoder
+**
+** The encoder that produces trellis2_dino_cond from an image, replacing the
+** external dump_dinodata.py. Mirrors transformers' DINOv3ViTModel driven the
+** way TRELLIS.2's DinoV3FeatureExtractor drives it: manual embeddings ->
+** axial-2D-RoPE -> 24 layers, and an affine-free LayerNorm on the last layer
+** output (the model's own final `norm` is NOT applied).
+*****************************************************************************/
+
+struct trellis2_dino_hparams {
+    int32_t hidden_size         = 0;
+    int32_t n_layers            = 0;
+    int32_t n_heads             = 0;
+    int32_t intermediate_size   = 0;
+    int32_t patch_size          = 0;
+    int32_t num_register_tokens = 0;
+    float   layer_norm_eps      = 1e-5f;
+    float   rope_theta          = 100.0f;
+    float   image_mean[3]       = {0.485f, 0.456f, 0.406f};
+    float   image_std[3]        = {0.229f, 0.224f, 0.225f};
+    int32_t file_type           = 0;   // 0=f32, 1=f16
+
+    int32_t head_dim() const { return n_heads ? hidden_size / n_heads : 0; }
+};
+
+// Opaque handle to a loaded DINOv3 encoder (weights + metadata).
+struct trellis2_dino_model;
+
+// Optional per-layer activation taps for numerical validation. When a non-null
+// pointer is passed to trellis2_dino_encode, every captured intermediate is
+// appended as (name, row-major f32 buffer). Names match the reference dumper
+// (scripts/dump_dino_reference.py): "embd", "l{i}.out", "cond", plus detail
+// taps "l{i}.{norm1,attention,layer_scale1,norm2,mlp,layer_scale2}" for the
+// first and last layer.
+struct trellis2_dino_taps {
+    std::vector<std::string>        names;
+    std::vector<std::vector<float>> data;
+};
+
+// Load the DINOv3 encoder from a GGUF produced by convert_dino_to_gguf.py.
+TRELLIS2_API trellis2_dino_model *
+trellis2_dino_load(const std::string & path,
+                   bool load_tensors = true,
+                   std::string * error = nullptr,
+                   const char * device = nullptr);
+
+TRELLIS2_API void trellis2_dino_free(trellis2_dino_model * m);
+
+TRELLIS2_API const char * trellis2_dino_backend_name(const trellis2_dino_model * m);
+
+TRELLIS2_API const trellis2_dino_hparams &
+trellis2_dino_hparams_of(const trellis2_dino_model * m);
+
+// Encode ImageNet-normalized pixel values into the conditioning tensor.
+//
+//   pixel_values : [3 * S * S] floats, CHW ((x - mean) / std already applied) —
+//                  exactly the flattened [1, 3, S, S] the Python forward sees.
+//   image_size   : S; must be a multiple of patch_size (512 for the TRELLIS.2
+//                  "512" pipeline -> 1 CLS + 4 register + 1024 patch tokens).
+//   out          : the conditioning tensor, shape {1, N, C}.
+//   taps         : optional activation capture for validation (see above).
+//
+// Returns false on failure and (if `error`) fills it with a reason.
+TRELLIS2_API bool
+trellis2_dino_encode(trellis2_dino_model * m,
+                     const float * pixel_values, int image_size,
+                     trellis2_dino_cond & out,
+                     trellis2_dino_taps * taps = nullptr,
+                     std::string * error = nullptr);
+
+// Convenience wrapper: 8-bit RGB (HWC, [S*S*3]) -> /255 -> ImageNet normalize
+// -> trellis2_dino_encode.
+TRELLIS2_API bool
+trellis2_dino_encode_rgb(trellis2_dino_model * m,
+                         const uint8_t * rgb, int image_size,
+                         trellis2_dino_cond & out,
+                         std::string * error = nullptr);
+
+/*****************************************************************************
+** Public API – Image preprocessing (TRELLIS.2 pipeline.preprocess_image)
+**
+** For an RGBA input with a meaningful alpha channel (the "has_alpha" path;
+** background removal nets are not ported): downscale so max(W,H) <= 1024,
+** square-crop around the alpha>0.8 bounding box, premultiply onto black, and
+** LANCZOS-resize to out_size x out_size RGB. The resampler reproduces PIL's
+** fixed-point uint8 Lanczos-3 so results match the Python pipeline.
+*****************************************************************************/
+
+// rgba: [h * w * 4] bytes. On success out_rgb has out_size*out_size*3 bytes.
+// Fails if the image has no pixels with alpha > 0.8*255.
+TRELLIS2_API bool
+trellis2_preprocess_rgba(const uint8_t * rgba, int w, int h,
+                         int out_size, std::vector<uint8_t> & out_rgb,
+                         std::string * error = nullptr);
+
+/*****************************************************************************
 ** Public API – DINOv3 conditioning (.dinodata)
 *****************************************************************************/
 
@@ -295,3 +527,8 @@ TRELLIS2_API bool trellis2_load_dinodata(const std::string & path,
 // Compute fingerprints over a loaded cond (min/max/mean/sum/l2/count).
 TRELLIS2_API trellis2_dino_fingerprint
 trellis2_dino_fingerprints(const trellis2_dino_cond & cond);
+
+// Write a cond to a .dinodata file (the format trellis2_load_dinodata reads).
+TRELLIS2_API bool trellis2_save_dinodata(const std::string & path,
+                                         const trellis2_dino_cond & cond,
+                                         std::string * error = nullptr);

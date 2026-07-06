@@ -1,23 +1,75 @@
 # trellis2.cpp
 
 A C++/[ggml](https://github.com/ggml-org/ggml) implementation of the
-**TRELLIS.2** image-to-3D pipeline (stage 1 first: sparse-structure flow).
+**TRELLIS.2** image-to-3D geometry pipeline: an image goes in, a 3D mesh comes
+out, with all inference in C++/ggml (no PyTorch at runtime). No PBR textures
+yet — geometry only.
 
 Modeled structurally after [sam3.cpp](https://github.com/rms80/sam3.cpp):
 single-file library (`trellis2.h` / `trellis2.cpp`), bundled ggml as a
 submodule (Metal on by default on Apple), DLL-export decoration, and a
-CMake build with example executables.
+CMake build with example executables. A flat C ABI (`trellis2_capi.h`) drives
+a Go demo server with a browser mesh viewer.
 
-## Status
+## Quick start (demo)
 
-Early scaffolding. Implemented so far:
+```sh
+git submodule update --init --depth 1                 # ggml
+scripts/download_models.sh                            # HF checkpoints -> models/ (~7 GB)
+docker build -f docker/Dockerfile.ref  -t trellis2-ref  docker   # convert weights / gen refs
+docker build -f docker/Dockerfile.demo -t trellis2-demo docker   # CUDA runtime + Go
+# convert every checkpoint to GGUF (f16 for the demo, f32 for validation)
+docker run --rm -v "$PWD":/work -w /work trellis2-ref bash scripts/convert_all.sh
+# build the CUDA shared lib + Go server, then run
+docker run --rm -v "$PWD":/work -w /work trellis2-demo bash -c '
+  cmake -B build-cuda-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_SHARED_LIBS=ON && cmake --build build-cuda-shared -j
+  cd server && go build -o trellis2-server-linux .'
+docker run --rm --device nvidia.com/gpu=all -v "$PWD":/work -w /work/server -p 8742:8742 \
+  trellis2-demo ./trellis2-server-linux -lib /work/build-cuda-shared/libtrellis2.so -ggufs /work/ggufs
+# open http://localhost:8742 , drop an image (transparent background works best)
+```
 
-- **`.dinodata` loader** — reads the DINOv3 conditioning tensor that the
-  sparse-structure flow DiT consumes as cross-attention K/V. This is the full
-  DINOv3 ViT-L/16 token sequence (`[1, 1029, 1024]` = 1 CLS + 4 register +
-  1024 patch) of the **last transformer layer** with an **affine-free
-  LayerNorm** (NOT HF's `last_hidden_state`). `neg_cond = zeros_like(cond)`,
-  so it is never stored. Files are produced by `trellis2-shiv/dump_dinodata.py`.
+Drop the shape-SLAT models (`-coarse`, or omit `slat_flow`/`shape_dec` GGUFs)
+to fall back to the fast 64³ marching-cubes preview. On a 16 GB RTX 50-series
+the full fine path (1.3B SS-flow + 1.3B shape-SLAT + sparse U-Net decoder)
+runs image→mesh in ~110 s and yields a ~1M-vertex 512³ dual-grid mesh.
+
+## Pipeline
+
+```
+image (RGBA)
+  → preprocess          alpha bbox crop, premultiply, PIL-exact Lanczos-512   [C++, byte-exact]
+  → DINOv3 ViT-L/16     [1, 1029, 1024] conditioning tokens                   [C++/ggml]
+  → SS-flow DiT         1.3B dense DiT, 12-step CFG flow-Euler → z_s          [C++/ggml]
+  → SS decoder          dense 3D-conv → 64³ occupancy → 32³ voxel scaffold    [C++/ggml]
+  → shape-SLAT DiT      1.3B sparse DiT over active voxels, 12-step CFG       [C++/ggml]
+  → shape VAE decoder   sparse ConvNeXt U-Net, 16× up → 512³ dual-grid fields [C++/ggml]
+  → flexible dual grid  → triangle mesh                                       [C++]
+```
+
+Every stage is validated tap-by-tap against the PyTorch reference — see
+[docs/VERIFICATION.md](docs/VERIFICATION.md). Highlights: preprocessing is
+byte-exact, the DINOv3 encoder matches to rel-L2 ≤ 7e-7 across 40 taps, and the
+sparse U-Net decoder is numerically exact through all four conv levels.
+
+## Components
+
+- **Image preprocessing + DINOv3 encoder** — `trellis2_preprocess_rgba()`
+  reproduces `pipeline.preprocess_image` (the has-alpha path) with a
+  PIL-compatible fixed-point Lanczos-3 resampler (byte-exact vs Pillow).
+  `trellis2_dino_encode()` runs the full DINOv3 ViT-L/16 (axial-2D RoPE,
+  LayerScale, exact-GELU MLP) and applies the affine-free final LayerNorm the
+  flow models expect — the `[1, 1029, 1024]` conditioning that used to come
+  from an external `dump_dinodata.py`. `dino_encode` chains them:
+
+  ```sh
+  ./build/examples/dino_encode ggufs/dino_f16.gguf image.png cond.dinodata
+  ```
+
+- **`.dinodata` loader** — `trellis2_load_dinodata()` still reads/writes the
+  precomputed conditioning tensor (1 CLS + 4 register + 1024 patch, last layer,
+  affine-free LN; `neg_cond = zeros_like(cond)`), for testing and CLI chaining.
 
 - **SS-flow DiT weights** — `convert_ss_flow_to_gguf.py` converts the stage-1
   `ss_flow_img_dit_1_3B_64_bf16` checkpoint to GGUF; `trellis2_ss_flow_load()`
@@ -58,16 +110,28 @@ Early scaffolding. Implemented so far:
   # -> logits [1,64,64,64], occupied(>0) grid (the coarse voxel scaffold)
   ```
 
-- **Occupancy → mesh** — `ss_mesh` decodes a z_s latent and exports the
+- **Occupancy → coarse mesh** — `ss_mesh` decodes a z_s latent and exports the
   `{logit = 0}` isosurface as a watertight OBJ via a self-contained marching
   cubes (`examples/marching_cubes.h`, the tetrahedral / Freudenthal variant — no
-  256-row table, provably manifold). Chain it after sampling to *see* the result:
+  256-row table, provably manifold). This is the fast preview path:
 
   ```sh
   ./build/examples/ss_sample ss_flow_dit_f16.gguf /path/img.dinodata z_s.latent
   ./build/examples/ss_mesh   ss_dec_f16.gguf z_s.latent shape.obj --normalize
   # -> watertight shape.obj in the centered unit cube; open in any 3D viewer
   ```
+
+- **Shape-SLAT flow + decoder (fine geometry)** — `trellis2_slat_flow_sample()`
+  runs the sparse 1.3B DiT over the active voxels of the 32³ scaffold (same
+  block structure as the SS-flow DiT, 3D RoPE over each voxel's coords),
+  denormalized with `shape_slat_normalization` baked into the GGUF.
+  `trellis2_shape_dec_decode()` runs `FlexiDualGridVaeDecoder` — a sparse
+  ConvNeXt U-Net whose 3×3×3 submanifold convolutions are expressed as 27
+  gather+GEMM steps, with each level's learned subdivision growing the active
+  set (32³ → 512³, 16×). `examples/flexible_dual_grid.h` turns the 7-channel
+  per-voxel output (dual-vertex offset, per-axis intersection flags, quad split
+  weight) into the triangle mesh. This is the real TRELLIS.2 geometry, driven
+  end-to-end by the demo server.
 
 ## Validate the forward pass
 

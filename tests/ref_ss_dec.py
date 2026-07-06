@@ -28,22 +28,20 @@ import sys
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-SHIV = os.path.expanduser("~/git/temp/trellis2-shiv")
-sys.path.insert(0, os.path.join(SHIV, "TRELLIS.2"))
+SHIV = os.environ.get("TRELLIS2_PY", "/trellis2")
+sys.path.insert(0, SHIV)
 
 import numpy as np
 import torch
 
-DEFAULT_CKPT = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--microsoft--TRELLIS-image-large/snapshots/"
-    "25e0d31ffbebe4b5a97464dd851910efc3002d96/ckpts/ss_dec_conv3d_16l8_fp16"
-)
+DEFAULT_CKPT = os.environ.get("TRELLIS2_CKPT", os.path.join(
+    os.path.dirname(__file__), "..", "models", "TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16"))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=DEFAULT_CKPT)
-    ap.add_argument("--device", default="mps", choices=["mps", "cpu"])
+    ap.add_argument("--device", default="cpu", choices=["mps", "cpu", "cuda"])
     ap.add_argument("--latent", default=None, help="optional z_s .latent (channel-major float32)")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "ss_dec_ref.bin"))

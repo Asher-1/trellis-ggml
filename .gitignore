@@ -36,3 +36,25 @@ tests/ss_dec_ref.bin
 
 # clangd index
 .cache/
+corpus_*/
+crash-*
+
+# fuzzing
+/corpus_*/
+crash-*
+/fuzz/crashes-fixed/
+
+# demo server build artifacts
+/server/trellis2-server
+/server/trellis2-server-linux
+/server/vendor/
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# model / reference artifacts
+/models/
+/ggufs/
+/dumps/
+slow-unit-*

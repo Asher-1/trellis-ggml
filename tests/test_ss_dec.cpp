@@ -28,6 +28,14 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string gguf_path = argv[1], ref_path = argv[2];
+
+    {
+        std::ifstream _a(gguf_path), _b(ref_path);
+        if (!_a.good() || !_b.good()) {
+            std::fprintf(stderr, "missing input file(s), skipping\n");
+            return 77;
+        }
+    }
     const double rel_tol = (argc > 3) ? std::atof(argv[3]) : 3e-2;
 
     std::ifstream f(ref_path, std::ios::binary);

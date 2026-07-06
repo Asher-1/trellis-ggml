@@ -20,6 +20,17 @@ endif()
 # ─────────────────────────────────────────────────────────────────────────
 option(TRELLIS2_USE_EXTERNAL_GGML "Consume external ggml via find_package() instead of the bundled submodule" OFF)
 
+# libFuzzer harnesses (clang only). The sanitizer flags apply globally — set
+# BEFORE any target so the whole tree (ggml, stb decode, preprocessing,
+# loaders) is instrumented. Harness targets live in fuzz/ (added at the end).
+option(TRELLIS2_FUZZ "Build libFuzzer harnesses (requires clang)" OFF)
+set(TRELLIS2_FUZZ_SANITIZERS "address,undefined" CACHE STRING
+    "Sanitizers for the fuzz build")
+if(TRELLIS2_FUZZ)
+    add_compile_options(-fsanitize=${TRELLIS2_FUZZ_SANITIZERS} -fsanitize=fuzzer-no-link -fno-omit-frame-pointer -g -O1)
+    add_link_options(-fsanitize=${TRELLIS2_FUZZ_SANITIZERS})
+endif()
+
 # ggml options — enable Metal on Apple (bundled-ggml path only)
 option(TRELLIS2_METAL "Enable Metal backend" ON)
 if(APPLE AND TRELLIS2_METAL AND NOT TRELLIS2_USE_EXTERNAL_GGML)
@@ -35,11 +46,13 @@ else()
     set(TRELLIS2_GGML_TARGET ggml)
 endif()
 
-add_library(trellis2 trellis2.cpp trellis2.h)
+add_library(trellis2 trellis2.cpp trellis2.h trellis2_capi.cpp trellis2_capi.h)
 target_include_directories(trellis2 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/stb
 )
+# trellis2_capi.cpp reuses the example isosurface extractor for the demo path.
+target_include_directories(trellis2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
 
 if(TRELLIS2_USE_EXTERNAL_GGML AND DEFINED GGML_INCLUDE_DIR)
     target_include_directories(trellis2 PUBLIC ${GGML_INCLUDE_DIR})
@@ -62,5 +75,10 @@ endif()
 
 option(TRELLIS2_BUILD_TESTS "Build test executables" OFF)
 if(TRELLIS2_BUILD_TESTS)
+    enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(TRELLIS2_FUZZ)
+    add_subdirectory(fuzz)
 endif()

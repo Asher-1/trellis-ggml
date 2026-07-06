@@ -29,16 +29,14 @@ os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
 os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-SHIV = os.path.expanduser("~/git/temp/trellis2-shiv")
-sys.path.insert(0, os.path.join(SHIV, "TRELLIS.2"))
+SHIV = os.environ.get("TRELLIS2_PY", "/trellis2")
+sys.path.insert(0, SHIV)
 
 import numpy as np
 import torch
 
-DEFAULT_CKPT = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--microsoft--TRELLIS.2-4B/snapshots/"
-    "af44b45f2e35a493886929c6d786e563ec68364d/ckpts/ss_flow_img_dit_1_3B_64_bf16"
-)
+DEFAULT_CKPT = os.environ.get("TRELLIS2_CKPT", os.path.join(
+    os.path.dirname(__file__), "..", "models", "TRELLIS.2-4B/ckpts/ss_flow_img_dit_1_3B_64_bf16"))
 
 
 def load_dinodata(path):
@@ -52,9 +50,9 @@ def load_dinodata(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dinodata", default=os.path.expanduser("~/git/temp/images/MushroomBoy.dinodata"))
+    ap.add_argument("--dinodata", default=os.path.join(os.path.dirname(__file__), "..", "dumps", "fixture.dinodata"))
     ap.add_argument("--ckpt", default=DEFAULT_CKPT)
-    ap.add_argument("--device", default="mps", choices=["mps", "cpu"])
+    ap.add_argument("--device", default="cpu", choices=["mps", "cpu", "cuda"])
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "ss_sample_ref.bin"))
     args = ap.parse_args()
