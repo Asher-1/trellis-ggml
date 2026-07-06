@@ -10,4 +10,5 @@ FROM trellis2-ref
 ADD https://go.dev/dl/go1.24.4.linux-amd64.tar.gz /tmp/go.tgz
 RUN tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
 ENV PATH=/usr/local/go/bin:$PATH
-ENV GOFLAGS=-mod=vendor
+# go.sum is committed; `go build` fetches the single dep (purego) on demand.
+# A committed server/vendor/ dir (if present) is used automatically.
