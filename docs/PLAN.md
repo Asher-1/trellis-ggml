@@ -79,3 +79,30 @@ GGUF model files are trusted assets (same threat model as privacy-filter).
 5. shape-SLAT flow port (sparse DiT) + validation
 6. FDG VAE decoder + flexible-dual-grid mesher + validation → real mesh in demo
 7. docs (VERIFICATION.md), CUDA build check, quantized variants, benchmarks
+
+## Status (done)
+
+All of 1–7 complete. Image→mesh works end-to-end, C++/ggml only, coarse
+(marching-cubes preview) and fine (512³ dual-grid) paths, in the Go demo. Every
+stage validated tap-by-tap (docs/VERIFICATION.md): preprocessing byte-exact,
+DINOv3 rel-L2 ≤7e-7, sparse U-Net decoder exact through 4 levels. CUDA build
+(sm_120) works; 3D-conv decoders pinned to CPU. One fuzz bug found+fixed.
+
+Runtime on the 16 GB RTX 5070 Ti: coarse ~34 s, fine ~110 s.
+
+## Not done (out of original scope / future)
+
+- **PBR textures** — the tex-SLAT flow + tex decoder + UV/bake stack. Explicitly
+  deferred ("initial goal is just the mesh").
+- **Cascade paths** (1024 / 1536 / *_cascade) — only the "512" pipeline type is
+  ported. Cascade needs the decoder `.upsample()` coord prediction + HR flow.
+- **Background removal** (BiRefNet/RMBG-2.0) — the demo instructs a transparent
+  PNG and uses the image as-is otherwise. A separate ~1 GB seg model.
+- **CUDA 3D-conv kernels** — the SS/shape decoders run on CPU because bundled
+  ggml has no CUDA CONV_3D. A custom kernel would speed up the fine path.
+- **Quantized shipping variants / benchmarks / CI** — f16 is the demo default;
+  q8/q4 conversion + a benchmark table + a two-tier CI workflow are the natural
+  next hardening steps (privacy-filter.cpp has the template).
+- **CPU-only SLAT sampler tightness in ctest** — the `slat` ctest is labeled
+  slow and validated in-container; the sampler validates tightly on CPU
+  (TRELLIS2_SLAT_STRICT=1) but that CPU run is minutes-long.
