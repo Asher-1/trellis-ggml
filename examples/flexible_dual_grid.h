@@ -10,8 +10,8 @@
 //   split_weight  softplus(feat[6])
 // For each voxel with an intersected axis, the 4 voxels around that edge
 // (offsets below) contribute their dual vertices as a quad; if all 4 exist the
-// quad is split into 2 triangles by whichever diagonal gives better-aligned
-// face normals (matching the split_weight product tie-break).
+// quad is split into 2 triangles along the diagonal chosen by the decoder's
+// learned split_weight = softplus(feat[6]) (reference eval-path tie-break).
 #pragma once
 
 #include <cmath>
@@ -98,25 +98,19 @@ inline Mesh extract(const float * feats, const int32_t * coords, int n,
             }
             if (!ok) continue;
 
-            // choose the diagonal split with better-aligned normals
-            const float * v0 = &V[(size_t) q[0] * 3];
-            const float * v1 = &V[(size_t) q[1] * 3];
-            const float * v2 = &V[(size_t) q[2] * 3];
-            const float * v3 = &V[(size_t) q[3] * 3];
-            auto align = [&](const float * a, const float * b, const float * c,
-                             const float * d) {
-                // two triangles (a,b,c) and (a,c,d): |n_abc . n_acd|
-                float e1[3], e2[3], n0[3], n1[3];
-                for (int k = 0; k < 3; ++k) { e1[k] = b[k]-a[k]; e2[k] = c[k]-a[k]; }
-                cross(e1, e2, n0);
-                for (int k = 0; k < 3; ++k) { e1[k] = c[k]-a[k]; e2[k] = d[k]-a[k]; }
-                cross(e1, e2, n1);
-                return std::fabs(n0[0]*n1[0] + n0[1]*n1[1] + n0[2]*n1[2]);
+            // Choose the quad diagonal by the decoder's learned split_weight
+            // (softplus of feat[6]), exactly as the reference eval path does
+            // (FlexiDualGridVaeDecoder -> flexible_dual_grid_to_mesh, train=False):
+            //   split 1: (0,1,2)+(0,2,3)   when sw0*sw2 >  sw1*sw3
+            //   split 2: (0,1,3)+(3,1,2)   otherwise
+            // (A geometric best-aligned-normals heuristic is the reference's
+            // split_weight=None fallback; the shipped decoder always emits
+            // feat[6], so we follow the learned choice.)
+            auto sw = [&](int i) {
+                const float x = feats[(size_t) q[i] * 7 + 6];
+                return x > 20.0f ? x : std::log1p(std::exp(x));   // softplus
             };
-            // split 1: (0,1,2)+(0,2,3); split 2: (0,1,3)+(3,1,2)
-            const float a0 = align(v0, v1, v2, v3);
-            const float a1 = align(v0, v1, v3, v2);   // reordered for split 2
-            if (a0 >= a1) {
+            if (sw(0) * sw(2) > sw(1) * sw(3)) {
                 m.tris.push_back(q[0]); m.tris.push_back(q[1]); m.tris.push_back(q[2]);
                 m.tris.push_back(q[0]); m.tris.push_back(q[2]); m.tris.push_back(q[3]);
             } else {
