@@ -128,9 +128,26 @@ inline Mesh extract(const float * feats, const int32_t * coords, int n,
     return m;
 }
 
-// Per-vertex normals from area-weighted face normals (for shading).
+// Per-vertex shading normals, robust to the dual grid's unoriented winding.
+//
+// The reference flexible_dual_grid mesher emits every quad with a fixed vertex
+// order (edge_neighbor_voxel_offset) regardless of which way the surface crosses
+// the edge, so ~15-20% of faces are wound opposite to their neighbours. A plain
+// area-weighted vector sum (sum of signed face normals) therefore partially
+// cancels at those vertices, producing short, noisy normals and salt-and-pepper
+// shading. This is faithful to TRELLIS.2 (its mesh is unoriented too) but looks
+// grainy under one-sided lighting.
+//
+// Instead accumulate the area-weighted *structure tensor* A = sum(area * n̂ n̂ᵀ).
+// Because n̂ n̂ᵀ == (−n̂)(−n̂)ᵀ it is immune to winding sign, so its dominant
+// eigenvector recovers the true surface-normal *direction* even where signed
+// normals cancel. We resolve the (arbitrary) sign to agree with the signed sum
+// for determinism; final shading is orientation-independent (see the viewer's
+// abs(dot) diffuse), so the sign only needs to be stable, not globally correct.
 inline std::vector<float> vertex_normals(const Mesh & m) {
-    std::vector<float> nrm(m.verts.size(), 0.0f);
+    const size_t nv = m.n_verts();
+    std::vector<double> A((size_t) nv * 6, 0.0);  // sym 3x3: xx,yy,zz,xy,xz,yz
+    std::vector<float>  sgn((size_t) nv * 3, 0.0f); // signed area-weighted sum (sign seed)
     for (size_t t = 0; t < m.tris.size(); t += 3) {
         const int i0 = m.tris[t], i1 = m.tris[t + 1], i2 = m.tris[t + 2];
         const float * a = &m.verts[(size_t) i0 * 3];
@@ -138,14 +155,44 @@ inline std::vector<float> vertex_normals(const Mesh & m) {
         const float * c = &m.verts[(size_t) i2 * 3];
         float e1[3], e2[3], fn[3];
         for (int k = 0; k < 3; ++k) { e1[k] = b[k]-a[k]; e2[k] = c[k]-a[k]; }
-        detail::cross(e1, e2, fn);
-        for (int i : {i0, i1, i2})
-            for (int k = 0; k < 3; ++k) nrm[(size_t) i * 3 + k] += fn[k];
+        detail::cross(e1, e2, fn);   // |fn| == 2*area, direction == face normal
+        const double area = std::sqrt((double) fn[0]*fn[0] +
+                                      (double) fn[1]*fn[1] +
+                                      (double) fn[2]*fn[2]);
+        if (area <= 1e-20) continue;
+        const double inv = 1.0 / area;                       // area * (fn/|fn|)(fn/|fn|)ᵀ
+        const double xx = fn[0]*fn[0]*inv, yy = fn[1]*fn[1]*inv, zz = fn[2]*fn[2]*inv;
+        const double xy = fn[0]*fn[1]*inv, xz = fn[0]*fn[2]*inv, yz = fn[1]*fn[2]*inv;
+        for (int i : {i0, i1, i2}) {
+            double * Av = &A[(size_t) i * 6];
+            Av[0]+=xx; Av[1]+=yy; Av[2]+=zz; Av[3]+=xy; Av[4]+=xz; Av[5]+=yz;
+            float * sv = &sgn[(size_t) i * 3];
+            sv[0]+=fn[0]; sv[1]+=fn[1]; sv[2]+=fn[2];
+        }
     }
-    for (size_t v = 0; v < m.n_verts(); ++v) {
-        float * nn = &nrm[v * 3];
-        const float len = std::sqrt(nn[0]*nn[0] + nn[1]*nn[1] + nn[2]*nn[2]);
-        if (len > 1e-12f) { nn[0] /= len; nn[1] /= len; nn[2] /= len; }
+    std::vector<float> nrm((size_t) nv * 3, 0.0f);
+    for (size_t v = 0; v < nv; ++v) {
+        const double * Av = &A[v * 6];
+        // dominant eigenvector of the symmetric structure tensor via power
+        // iteration, seeded from the signed sum (a good guess where it survives).
+        double x = sgn[v*3], y = sgn[v*3+1], z = sgn[v*3+2];
+        double l = std::sqrt(x*x + y*y + z*z);
+        if (l < 1e-20) { x = Av[0]; y = Av[3]; z = Av[4]; l = std::sqrt(x*x+y*y+z*z); }
+        if (l < 1e-20) { nrm[v*3]=0.0f; nrm[v*3+1]=0.0f; nrm[v*3+2]=1.0f; continue; }
+        x/=l; y/=l; z/=l;
+        for (int it = 0; it < 8; ++it) {
+            const double nx = Av[0]*x + Av[3]*y + Av[4]*z;
+            const double ny = Av[3]*x + Av[1]*y + Av[5]*z;
+            const double nz = Av[4]*x + Av[5]*y + Av[2]*z;
+            const double nl = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (nl < 1e-20) break;
+            x = nx/nl; y = ny/nl; z = nz/nl;
+        }
+        const float * sv = &sgn[v*3];
+        const double s = (x*sv[0] + y*sv[1] + z*sv[2]) < 0.0 ? -1.0 : 1.0;
+        nrm[v*3]   = (float) (s*x);
+        nrm[v*3+1] = (float) (s*y);
+        nrm[v*3+2] = (float) (s*z);
     }
     return nrm;
 }

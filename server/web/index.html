@@ -281,7 +281,10 @@ const viewer = (() => {
     vec3 n = normalize(vNrm);
     vec3 l1 = normalize(vec3(0.5, 0.8, 0.6));
     vec3 l2 = normalize(vec3(-0.6, -0.2, -0.7));
-    float d = max(dot(n, l1), 0.0) * 0.75 + max(dot(n, l2), 0.0) * 0.25;
+    // The dual-grid mesh has unoriented winding (faithful to TRELLIS.2), so
+    // per-vertex normals are a direction line, not a signed outward normal.
+    // Shade orientation-independently (abs) so back-wound faces don't go dark.
+    float d = abs(dot(n, l1)) * 0.75 + abs(dot(n, l2)) * 0.25;
     vec3 base = vec3(0.62, 0.68, 0.74);
     vec3 c = base * (0.25 + 0.75 * d);
     frag = vec4(pow(c, vec3(1.0/2.2)), 1.0);
