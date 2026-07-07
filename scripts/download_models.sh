@@ -38,6 +38,17 @@ fetch $T2 ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.json       TRELLIS.2-4B
 fetch $T2 ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors TRELLIS.2-4B
 fetch $T2 ckpts/shape_dec_next_dc_f16c32_fp16.json               TRELLIS.2-4B
 fetch $T2 ckpts/shape_dec_next_dc_f16c32_fp16.safetensors        TRELLIS.2-4B
+# PBR texturing stack (Trellis2TexturingPipeline): shape encoder, tex decoder,
+# tex-SLAT flows (512/1024), and the texturing pipeline config (normalizations).
+fetch $T2 texturing_pipeline.json                                TRELLIS.2-4B
+fetch $T2 ckpts/shape_enc_next_dc_f16c32_fp16.json               TRELLIS.2-4B
+fetch $T2 ckpts/shape_enc_next_dc_f16c32_fp16.safetensors        TRELLIS.2-4B
+fetch $T2 ckpts/tex_dec_next_dc_f16c32_fp16.json                 TRELLIS.2-4B
+fetch $T2 ckpts/tex_dec_next_dc_f16c32_fp16.safetensors          TRELLIS.2-4B
+fetch $T2 ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json        TRELLIS.2-4B
+fetch $T2 ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors  TRELLIS.2-4B
+fetch $T2 ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.json       TRELLIS.2-4B
+fetch $T2 ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors TRELLIS.2-4B
 fetch $T1 ckpts/ss_dec_conv3d_16l8_fp16.json                     TRELLIS-image-large
 fetch $T1 ckpts/ss_dec_conv3d_16l8_fp16.safetensors              TRELLIS-image-large
 fetch "$DINO_REPO" config.json               dinov3-vitl16
