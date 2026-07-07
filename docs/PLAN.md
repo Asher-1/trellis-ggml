@@ -88,7 +88,75 @@ stage validated tap-by-tap (docs/VERIFICATION.md): preprocessing byte-exact,
 DINOv3 rel-L2 ≤7e-7, sparse U-Net decoder exact through 4 levels. CUDA build
 (sm_120) works; 3D-conv decoders pinned to CPU. One fuzz bug found+fixed.
 
-Runtime on the 16 GB RTX 5070 Ti: coarse ~34 s, fine ~110 s.
+Runtime on the 16 GB RTX 5070 Ti (GPU shape decode auto-enabled): fine (512³)
+**~39 s**, 1024 cascade **~133 s**. (Was 85 s for 512 with the decoder on CPU.)
+
+### Where the fine-path time goes (measured, `TRELLIS2_TIMING=1`)
+
+Per-stage wall-clock for one 512³ generation (f16, ~1.09 M-vertex mesh), CPU
+decoder vs the auto GPU decoder:
+
+| stage      | CPU decode | GPU decode | device (GPU mode) |
+|------------|-----------:|-----------:|-------------------|
+| dino       | 0.1 s      | 0.1 s      | GPU               |
+| ss_flow    | 21 s       | 21 s       | GPU               |
+| ss_dec     | 3 s        | 3 s        | CPU (dense CONV_3D)|
+| slat_flow  | 11 s       | 10 s       | GPU               |
+| shape_dec  | **49 s**   | **2.5 s**  | **GPU** (was 59 % of the run) |
+| mesh       | 0.2 s      | 0.2 s      | CPU               |
+| **total**  | **85 s**   | **39 s**   |                   |
+
+The original "GPU ~30 %" reading was the *average*: the biggest stage (the
+FlexiDualGrid VAE decoder) ran on the CPU with the GPU idle. It now runs on the
+GPU — **~2.5 s vs ~49 s, ~20×** — placed there automatically when VRAM allows
+(see the shape-decoder note under "Not done"). The flow DiTs (`ss_flow` +
+`slat_flow`) are now the bulk of the run. Two facts about them, from
+`TRELLIS2_TIMING`:
+
+- Attention is now `ggml_flash_attn_ext` for **all** flow forwards, not just the
+  cascade's huge token counts (`sdpa_auto`, `TRELLIS2_SDPA_EXACT` restores the
+  old materialized softmax). Flash is bit-identical to full softmax on the CPU
+  (both flow forwards still validate at ~2.4e-4 / 2.9e-4 rel-L2) and on the GPU
+  it is ~30 % faster *and* O(L) memory — the exact path's 805 MB score matrix
+  `alloc_graph`-fails once the resident pipeline leaves <~2 GB free, so flash is
+  what keeps the flow fitting under host-VRAM pressure, not only a speedup.
+- Each forward still runs at only ~17 % of the card's f16 tensor-core peak; the
+  matmuls already hit the f16 cores (ggml converts the f32 activations), so the
+  remaining slack is the f32 elementwise/permute traffic between matmuls. CUDA
+  graphs do not help (they `cudaGraphInstantiate`-OOM with the pipeline
+  resident) and are left off.
+
+The shape decoder is a *sparse* net that keeps millions of voxels in the tensor
+**row** dimension (`ne1`). ggml's CUDA CONCAT/PAD kernels launch a grid
+dimension equal to that count and abort (`invalid configuration argument`) above
+the 65535 grid-Y/Z limit — which is why the original port used the CPU. But
+CONCAT/PAD were only used to append one missing-neighbor zero row; replacing
+that with a clamp-index + 0/1-mask formulation (get_rows a valid row, multiply
+the missing ones by zero — byte-identical) keeps every op inside ggml kernels
+that tile the voxel dimension (`get_rows`, broadcast `mul`, `mul_mat`, `add`,
+`norm`, `silu` all verified OK at 3 M voxels). The decoder then runs on the GPU
+in ~2.5 s (512³) / ~12.5 s (1024³).
+
+### VRAM-aware auto-placement of the shape decoder
+
+The decoder's placement is decided from **measured free VRAM**
+(`trellis2_gpu_free_vram()` → `cudaMemGetInfo`), not a hardcoded flag:
+
+- At load, `t2_pipeline_load` records the free VRAM *before* the flow DiTs are
+  loaded (= what freeing them again reclaims) and places the decoder on the GPU
+  when that covers the target tier's decode peak (~3 GB at 512³, ~7.5 GB at
+  1024³) plus the decoder weights and a margin; otherwise CPU. `TRELLIS2_SHAPE_DEC_GPU`
+  / `_CPU` force it; a CPU-only build (no GPU device) always picks CPU.
+- At decode time, `ensure_decode_vram` checks free VRAM again and, if the decode
+  would not fit, frees the flow DiTs (all finished by then) to reclaim their
+  ~5–7 GB; `reload_flows` brings them back on the next `t2_generate` (a few
+  seconds from page cache). So 512³ decodes with the flows resident (no reload
+  cost) while the big 1024³ decode transparently frees-and-reloads. This is the
+  `T2_LOAD_LOW_VRAM` idea, applied automatically only when the numbers require it.
+
+Validated end-to-end on the 16 GB card with **no env vars**: 512 → 39 s, 1024
+cascade → 133 s (the 1024³ GPU decode is 12.5 s), and three back-to-back cascade
+generations exercise the free/reload path with no OOM.
 
 ## Not done (out of original scope / future)
 
@@ -102,14 +170,20 @@ Runtime on the 16 GB RTX 5070 Ti: coarse ~34 s, fine ~110 s.
   HR flow forward rel-L2 3.1e-4 (CPU). The 1024³ decode is the same decoder
   validated exactly at the 512 tier; its explicit parity gate is behind
   `TRELLIS2_CASCADE_DECODE` because it transiently needs ~14 GB host RAM.
-- **Still to do:** `1536_cascade` (add the token-reduction loop + res 1536), and
-  the **<8 GB low-VRAM mode** (load/free one 1.3B DiT per stage behind the
-  reserved `T2_LOAD_LOW_VRAM` flag). The cascade currently runs in the standard
-  all-resident mode (~10 GB VRAM).
+- **Still to do:** `1536_cascade` (add the token-reduction loop + res 1536). The
+  `<8 GB` case is now partly covered: the shape decoder auto-frees the flow DiTs
+  around a GPU decode (see below), so the pieces of the `T2_LOAD_LOW_VRAM`
+  lifecycle exist; a full per-stage load/free mode would extend that to the flow
+  DiTs themselves for cards that can't hold even one 1.3B DiT + a decode.
 - **Background removal** (BiRefNet/RMBG-2.0) — the demo instructs a transparent
   PNG and uses the image as-is otherwise. A separate ~1 GB seg model.
-- **CUDA 3D-conv kernels** — the SS/shape decoders run on CPU because bundled
-  ggml has no CUDA CONV_3D. A custom kernel would speed up the fine path.
+- **GPU shape decoder — DONE.** The mask-conv change plus the VRAM-aware
+  placement + free/reload lifecycle (both described above) make the decoder run
+  on the GPU automatically when it fits: 512³ ~2.5 s and 1024³ ~12.5 s vs ~49 s /
+  minutes on the CPU. No env var required; `TRELLIS2_SHAPE_DEC_{GPU,CPU}` still
+  force it, and it stays on the CPU on cards too small or in a CPU-only build.
+- **CUDA CONV_3D** — the SS *occupancy* decoder (`ss_dec`, 3 s) uses a genuine
+  dense `ggml_conv_3d_direct` with no CUDA kernel, so it stays on CPU regardless.
 - **Quantized shipping variants / benchmarks / CI** — f16 is the demo default;
   q8/q4 conversion + a benchmark table + a two-tier CI workflow are the natural
   next hardening steps (privacy-filter.cpp has the template).

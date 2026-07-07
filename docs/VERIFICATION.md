@@ -46,14 +46,18 @@ ctest --test-dir build                  # full parity (needs ggufs/ + dumps/)
 | **1024 cascade** — final 1024³ decode (3.97M voxels) | `test_cascade` | per-level features + subdivision + 7-ch output | **PASS**, rel-L2 ≤ 2e-2, set within 0.0001% |
 
 Notes:
-- **Hybrid attention.** `sdpa_auto()` uses exact materialized-softmax attention
-  while the `[L_k, L_q, heads]` score matrix stays under 1 GiB (everything in
-  the 512 tier — SS-flow 4096 tokens, SLAT ≤~2300 voxels — so the tap parity
-  above is the exact path), and switches to `ggml_flash_attn_ext` above that.
-  Flash is bit-faithful to full softmax on CPU (SS-flow 2.4e-4, SLAT 2.9e-4 —
-  identical to exact) but incurs ~3e-3 rel-L2 on the CUDA F16-MMA kernel. It is
-  what makes the HR cascade fit: benchmarked OK at the full 49,152-token cap on
-  16 GB, versus a 108 GiB exact self-attention matrix.
+- **Flash attention (default for every flow forward).** `sdpa_auto()` uses
+  `ggml_flash_attn_ext` for both flow DiTs at all token counts;
+  `TRELLIS2_SDPA_EXACT` restores the old materialized `[L_k, L_q, heads]`
+  softmax. Flash is bit-faithful to full softmax on CPU (SS-flow 2.4e-4, SLAT
+  2.9e-4 — identical to exact, so the tap parity above is unaffected) but incurs
+  ~3e-3 rel-L2 on the CUDA F16-MMA kernel. It was already required for the HR
+  cascade (49,152-token attention fits on 16 GB vs a 108 GiB exact matrix); it
+  is now the default because on the GPU it is also ~30 % faster per forward and
+  O(L) memory — the exact path's 805 MB SS-flow score matrix `alloc_graph`-fails
+  when the resident pipeline leaves little free VRAM. Was previously gated to
+  score matrices >1 GiB (i.e. only the HR stage). See docs/PLAN.md for the
+  per-stage runtime profile.
 - **TF32 matters.** PyTorch's default CUDA matmul/attention uses TF32 (≈10-bit
   mantissa) and reduced-precision flash SDPA, which shows up as ~1e-3 relative
   error versus true fp32. `scripts/ref_common.py` disables it so the golden

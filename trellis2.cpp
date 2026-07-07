@@ -8,6 +8,7 @@
 
 #include <vector>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -254,6 +255,14 @@ const char * kv_str(const gguf_context * g, const char * key, const char * def) 
 
 } // namespace
 
+size_t trellis2_gpu_free_vram(void) {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) return 0;                       // CPU-only build/host
+    size_t free = 0, total = 0;
+    ggml_backend_dev_memory(dev, &free, &total);
+    return free;
+}
+
 trellis2_ss_flow_model *
 trellis2_ss_flow_load(const std::string & path, bool load_tensors, std::string * error,
                       const char * device) {
@@ -408,27 +417,25 @@ bool trellis2_ss_flow_has_tensor(const trellis2_ss_flow_model * m,
 
 namespace {
 
-// Scaled dot-product attention with an automatic flash fallback. q3/k3/v3 are
-// [head_dim, n_head, L]; returns [n_head*head_dim, L_q].
+// Scaled dot-product attention via ggml_flash_attn_ext (tiled online softmax,
+// O(L) memory). q3/k3/v3 are [head_dim, n_head, L]; returns [n_head*head_dim, L_q].
 //
-// Small L uses the exact path (a materialized [L_k, L_q, heads] softmax) — it is
-// bit-faithful to the PyTorch full-softmax reference (validated to ~1e-4 rel-L2
-// on both flow DiTs). Once that score matrix would exceed ~1 GB — i.e. the HR
-// cascade stage's up-to-49k voxels, where it would otherwise be >100 GB — it
-// switches to ggml_flash_attn_ext: tiled online softmax, O(L) memory. Flash
-// costs the GPU's F16-MMA precision (~3e-3 rel-L2 per forward, immaterial to
-// the final mesh) but is the only way the cascade fits in VRAM at all.
-//
-// Both paths return [head_dim, n_head, L_q] before the reshape, so the choice
-// is invisible downstream.
+// Flash is the default for both flow DiTs: it is bit-faithful to full softmax on
+// CPU with F32 accumulation (validated to ~1e-4 rel-L2, identical to the exact
+// materialized path) but avoids the [L_k, L_q, heads] score matrix — which is
+// both the memory wall (the HR cascade's ~49k voxels would need >100 GB) and,
+// on GPU, ~30% of the forward's wall time (the softmax + the permute/cont copies
+// around it). On the CUDA F16-MMA kernel flash costs ~3e-3 rel-L2 per forward,
+// immaterial to the final mesh. Set TRELLIS2_SDPA_EXACT to force the old
+// materialized path (e.g. to reproduce the tightest GPU numbers).
 ggml_tensor * sdpa_auto(ggml_context * ctx, ggml_tensor * q3, ggml_tensor * k3,
                         ggml_tensor * v3, int C, float scale) {
-    const int64_t Lq = q3->ne[2], Lk = k3->ne[2], H = q3->ne[1];
     ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q3, 0, 2, 1, 3)); // [hd, Lq, H]
     ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k3, 0, 2, 1, 3)); // [hd, Lk, H]
     ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3)); // [hd, Lk, H]
 
-    if (Lq * Lk * H * (int64_t) sizeof(float) > ((int64_t) 1 << 30)) {    // > 1 GiB
+    static const bool exact = std::getenv("TRELLIS2_SDPA_EXACT") != nullptr;
+    if (!exact) {
         ggml_tensor * o = ggml_flash_attn_ext(ctx, qp, kp, vp, nullptr, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
         return ggml_reshape_2d(ctx, o, C, o->ne[2]);                      // [C, Lq]
@@ -498,6 +505,11 @@ bool trellis2_ss_flow_forward(trellis2_ss_flow_model * m,
     if (std::strcmp(hp.pe_mode, "rope") != 0) { set_error(error, "only pe_mode=rope is implemented"); return false; }
     if (!hp.share_mod)                         { set_error(error, "only share_mod=true is implemented"); return false; }
     if (cond_channels != hp.cond_channels)     { set_error(error, "cond_channels mismatch"); return false; }
+
+    const bool t2_timing = std::getenv("TRELLIS2_TIMING") != nullptr;
+    auto t_now = [] { return std::chrono::steady_clock::now(); };
+    auto t_ms  = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    auto t_start = t_now();
 
     const int   C   = hp.model_channels;     // 1536
     const int   R   = hp.resolution;         // 16
@@ -629,6 +641,7 @@ bool trellis2_ss_flow_forward(trellis2_ss_flow_model * m,
     }
 
     ggml_build_forward_expand(gf, y);
+    auto t_build = t_now();
 
     // ── allocate + run on the model's backend (GPU if available, else CPU) ────
     ggml_backend_t backend = m->backend;
@@ -638,6 +651,7 @@ bool trellis2_ss_flow_forward(trellis2_ss_flow_model * m,
         ggml_gallocr_free(alloc); ggml_free(ctx);
         return false;
     }
+    auto t_alloc = t_now();
 
     std::vector<float> emb = timestep_embedding(t, 256);
     std::vector<float> cosv, sinv;
@@ -648,11 +662,18 @@ bool trellis2_ss_flow_forward(trellis2_ss_flow_model * m,
     ggml_backend_tensor_set(cos_t, cosv.data(), 0, cosv.size() * es);
     ggml_backend_tensor_set(sin_t, sinv.data(), 0, sinv.size() * es);
     ggml_backend_tensor_set(cnd,   cond,        0, (size_t) cond_channels * Lkv * es);
+    auto t_upload = t_now();
 
     const ggml_status st = ggml_backend_graph_compute(backend, gf);
+    auto t_compute = t_now();
     bool ok = (st == GGML_STATUS_SUCCESS);
     if (ok) {
         ggml_backend_tensor_get(y, out, 0, (size_t) hp.out_channels * N * es);
+        if (t2_timing) {
+            std::fprintf(stderr, "[ss_flow] build=%.1f alloc=%.1f upload=%.1f compute=%.1f read=%.1f total=%.1f ms\n",
+                         t_ms(t_start, t_build), t_ms(t_build, t_alloc), t_ms(t_alloc, t_upload),
+                         t_ms(t_upload, t_compute), t_ms(t_compute, t_now()), t_ms(t_start, t_now()));
+        }
     } else {
         set_error(error, "graph compute failed");
     }
@@ -2368,6 +2389,14 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
     std::vector<float> up_hch, up_xch, up_subdiv;
     int prev_C = 0, prev_L = 0;
 
+    const bool t2_timing = std::getenv("TRELLIS2_TIMING") != nullptr;
+    double ms_nbr = 0, ms_graph = 0, ms_gather = 0;
+    auto t_now = [] { return std::chrono::steady_clock::now(); };
+    auto ms_since = [](std::chrono::steady_clock::time_point a) {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - a).count();
+    };
+
     for (int lvl = 0; lvl < n_levels; ++lvl) {
         const int C = hp.channels[lvl];
         const bool has_up = lvl < n_levels - 1;
@@ -2377,7 +2406,9 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         std::vector<std::vector<int32_t>> nidx;
         const bool needs_conv = hp.num_blocks[lvl] > 0 || has_up || lvl > 0;
         if (needs_conv) {
+            auto t0 = t_now();
             build_neighbor_indices(coords, L, nidx);
+            ms_nbr += ms_since(t0);
         }
 
         // ── graph: [child head from previous level] + blocks + up part A ────
@@ -2405,37 +2436,39 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
             return y;
         };
 
-        // neighbor index leaves (shared by every conv in this level) and a
-        // zero row appended to every conv input (missing-neighbor target).
-        std::vector<ggml_tensor *> idx_t(27, nullptr);
-        ggml_tensor * zero_row = nullptr;
-        std::vector<ggml_tensor *> zero_uploads;
+        // Per-offset neighbor leaves, shared by every conv in this level. A
+        // missing neighbor is handled without an appended zero row (the CUDA
+        // CONCAT/PAD kernels abort past 65535 voxels): idx_t[k] holds the
+        // neighbor row *clamped* into [0, L) and mask_t[k] is 0 there, 1 for a
+        // real neighbor — so get_rows gathers a valid (harmless) row and the
+        // mask multiply zeroes the missing contributions. Numerically identical
+        // to gathering an explicit zero row, but every op (get_rows, broadcast
+        // mul, mul_mat) stays within ggml kernels that tile the voxel dimension,
+        // so the decoder runs on the GPU as well as the CPU.
+        std::vector<ggml_tensor *> idx_t(27, nullptr), mask_t(27, nullptr);
         if (needs_conv) {
             for (int k = 0; k < 27; ++k) {
-                idx_t[k] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+                idx_t[k]  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+                mask_t[k] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L);  // [1, L]
                 ggml_set_input(idx_t[k]);
+                ggml_set_input(mask_t[k]);
             }
-            const int cmax = C > (has_up ? C_next * 8 : 0) ? C : C_next * 8;
-            zero_row = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cmax, 1);
-            ggml_set_input(zero_row);
-            zero_uploads.push_back(zero_row);
         }
 
-        // submanifold conv: x [Cin, L] (+ zero row) -> [Cout, L]
+        // submanifold conv: x [Cin, L] -> [Cout, L]
         auto conv = [&](ggml_tensor * x, const std::string & pfx) -> ggml_tensor * {
             ggml_tensor * w = W(pfx + ".weight");   // ne [Ci, 27, Co]
             ggml_tensor * b = W(pfx + ".bias");     // [Co]
             if (!w || !b) return x;
             const int64_t Ci = w->ne[0], Co = w->ne[2];
-            ggml_tensor * zero = ggml_view_2d(ctx, zero_row, Ci, 1, zero_row->nb[1], 0);
-            ggml_tensor * xe = ggml_concat(ctx, x, zero, 1);   // [Ci, L+1]
             ggml_tensor * acc = nullptr;
             for (int k = 0; k < 27; ++k) {
                 ggml_tensor * wk = ggml_cont(ctx, ggml_view_3d(ctx, w, Ci, 1, Co,
                                                                w->nb[1], w->nb[2], (size_t) k * w->nb[1]));
                 wk = ggml_reshape_2d(ctx, wk, Ci, Co);
-                ggml_tensor * g = ggml_get_rows(ctx, xe, idx_t[k]);   // [Ci, L]
-                ggml_tensor * y = ggml_mul_mat(ctx, wk, g);           // [Co, L]
+                ggml_tensor * g = ggml_get_rows(ctx, x, idx_t[k]);   // [Ci, L]
+                g = ggml_mul(ctx, g, mask_t[k]);                     // zero missing (broadcast [1,L])
+                ggml_tensor * y = ggml_mul_mat(ctx, wk, g);          // [Co, L]
                 acc = acc ? ggml_add(ctx, acc, y) : y;
             }
             return ggml_add(ctx, acc, b);
@@ -2525,13 +2558,21 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
             return false;
         }
 
-        // upload inputs
+        // upload inputs: clamp the missing-neighbor sentinel (L) into range and
+        // build its 0/1 mask (see the conv leaves above).
         if (needs_conv) {
+            std::vector<int32_t> clamped((size_t) L);
+            std::vector<float>   mask((size_t) L);
             for (int k = 0; k < 27; ++k) {
-                ggml_backend_tensor_set(idx_t[k], nidx[k].data(), 0, (size_t) L * sizeof(int32_t));
+                const std::vector<int32_t> & ik = nidx[k];
+                for (int v = 0; v < L; ++v) {
+                    const bool miss = ik[(size_t) v] >= L;
+                    clamped[(size_t) v] = miss ? 0 : ik[(size_t) v];
+                    mask[(size_t) v]    = miss ? 0.0f : 1.0f;
+                }
+                ggml_backend_tensor_set(idx_t[k],  clamped.data(), 0, (size_t) L * sizeof(int32_t));
+                ggml_backend_tensor_set(mask_t[k], mask.data(),    0, (size_t) L * sizeof(float));
             }
-            const std::vector<float> zbuf((size_t) zero_row->ne[0], 0.0f);
-            ggml_backend_tensor_set(zero_row, zbuf.data(), 0, zbuf.size() * sizeof(float));
         }
         if (lvl == 0) {
             ggml_backend_tensor_set(in_a, slat, 0, (size_t) hp.latent_channels * L * es);
@@ -2541,7 +2582,9 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
             ggml_backend_tensor_set(in_xch, up_xch.data(), 0, up_xch.size() * es);
         }
 
+        auto t_g = t_now();
         const ggml_status st = ggml_backend_graph_compute(m->backend, gf);
+        if (t2_timing) ms_graph += ms_since(t_g);
         if (st != GGML_STATUS_SUCCESS) {
             set_error(error, "graph compute failed (level " + std::to_string(lvl) + ")");
             ggml_gallocr_free(alloc); ggml_free(ctx);
@@ -2613,8 +2656,10 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
                                     full.data() + (size_t) cidx[(size_t) j] * chans, (size_t) chans * es);
                 }
             };
+            auto t_gh = t_now();
             host_gather(h1_o, C_next, up_hch);   // [C_next, L_child]
             host_gather(x_o,  C / 8,  up_xch);   // [C/8,     L_child]
+            if (t2_timing) ms_gather += ms_since(t_gh);
 
             prev_C = C;
             prev_L = L;
@@ -2642,10 +2687,16 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         // which upsample_times-1 always is), so return it and skip the rest.
         if (upsample_times >= 0 && lvl == upsample_times - 1) {
             out_coords = coords;
+            if (t2_timing)
+                std::fprintf(stderr, "[shape_dec] nbr=%.0f graph=%.0f gather=%.0f ms\n",
+                             ms_nbr, ms_graph, ms_gather);
             return true;
         }
     }
 
+    if (t2_timing)
+        std::fprintf(stderr, "[shape_dec] nbr=%.0f graph=%.0f gather=%.0f ms\n",
+                     ms_nbr, ms_graph, ms_gather);
     return true;
 }
 

@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -24,6 +25,16 @@ namespace {
 void copy_err(char * err, int err_len, const std::string & msg) {
     if (!err || err_len <= 0) return;
     std::snprintf(err, (size_t) err_len, "%s", msg.c_str());
+}
+
+// Rough peak VRAM the shape decode's transient buffers need at each tier
+// (measured on the reference image: ~2.4 GB at 512³, ~6.75 GB for the 1024³
+// level-3 conv output; rounded up for headroom). Mesh-dependent, so treated as
+// a threshold, not an exact reservation — the free-flows fallback then gives a
+// several-GB cushion if the estimate is low.
+size_t decode_vram_peak(int pipeline_type) {
+    const double GB = (double) (1ULL << 30);
+    return (size_t) ((pipeline_type == T2_PIPE_1024 ? 7.5 : 3.0) * GB);
 }
 
 } // namespace
@@ -39,6 +50,10 @@ struct t2_pipeline {
     bool fine = false;      // 512 dual-grid available
     bool cascade = false;   // 1024 cascade available
     int  flags = 0;
+    bool shapedec_gpu = false;   // shape decoder placed on the GPU (VRAM permitting)
+    // gguf paths, so the flow DiTs can be freed to make VRAM room for a GPU
+    // decode and lazily reloaded on the next generate (see ensure_decode_vram).
+    std::string ss_flow_path, slat_path, slat_hr_path;
 };
 
 // A generated mesh: verts (3/vertex), normals (3/vertex), tris (3/tri).
@@ -47,6 +62,40 @@ struct t2_mesh_result {
     std::vector<float> normals;
     std::vector<int>   tris;
 };
+
+namespace {
+
+// Reload any flow DiT freed by a previous GPU decode (see ensure_decode_vram).
+// No-op the common case where nothing was freed (pointers still set).
+bool reload_flows(t2_pipeline * p, std::string & e) {
+    if (!p->flow && !p->ss_flow_path.empty()) {
+        p->flow = trellis2_ss_flow_load(p->ss_flow_path.c_str(), true, &e);
+        if (!p->flow) return false;
+    }
+    if (!p->slat && !p->slat_path.empty()) {
+        p->slat = trellis2_slat_flow_load(p->slat_path.c_str(), true, &e);
+        if (!p->slat) return false;
+    }
+    if (!p->slat_hr && !p->slat_hr_path.empty()) {
+        p->slat_hr = trellis2_slat_flow_load(p->slat_hr_path.c_str(), true, &e);
+        if (!p->slat_hr) return false;
+    }
+    return true;
+}
+
+// Before a GPU shape decode, make room: if the decode's transient buffers would
+// not fit in current free VRAM, free the flow DiTs (all finished by decode time)
+// to reclaim their ~5-7 GB. reload_flows() brings them back on the next
+// generate. No-op for a CPU decoder or when the decode already fits.
+void ensure_decode_vram(t2_pipeline * p, int pipeline_type) {
+    if (!p->shapedec_gpu) return;
+    if (trellis2_gpu_free_vram() >= decode_vram_peak(pipeline_type)) return;
+    trellis2_ss_flow_free(p->flow);      p->flow    = nullptr;
+    trellis2_slat_flow_free(p->slat);    p->slat    = nullptr;
+    trellis2_slat_flow_free(p->slat_hr); p->slat_hr = nullptr;
+}
+
+} // namespace
 
 extern "C" {
 
@@ -65,11 +114,13 @@ t2_pipeline * t2_pipeline_load(const char * dino_gguf,
     p->flags = flags;
     p->dino = trellis2_dino_load(dino_gguf, true, &e);
     if (!p->dino) { copy_err(err, err_len, "dino: " + e); t2_pipeline_free(p); return nullptr; }
+    // Free VRAM before the flow DiTs are loaded == the VRAM reclaimable by
+    // freeing them again at decode time. Drives the shape-decoder placement.
+    const size_t free_pre_flows = trellis2_gpu_free_vram();
     p->flow = trellis2_ss_flow_load(ss_flow_gguf, true, &e);
     if (!p->flow) { copy_err(err, err_len, "ss_flow: " + e); t2_pipeline_free(p); return nullptr; }
-    // The 3D-conv decoders (CONV_3D and the sparse gather-GEMM) run on CPU:
-    // ggml has no CUDA CONV_3D kernel, and they are a small fraction of the
-    // total inference time compared with the flow DiTs.
+    // The SS occupancy decoder uses a genuine dense CONV_3D, for which ggml has
+    // no CUDA kernel, so it stays on the CPU (it is only ~3 s / 4 % anyway).
     p->dec = trellis2_ss_dec_load(ss_dec_gguf, true, &e, "cpu");
     if (!p->dec) { copy_err(err, err_len, "ss_dec: " + e); t2_pipeline_free(p); return nullptr; }
 
@@ -78,13 +129,44 @@ t2_pipeline * t2_pipeline_load(const char * dino_gguf,
     if (present(slat_flow_gguf) && present(shape_dec_gguf)) {
         p->slat = trellis2_slat_flow_load(slat_flow_gguf, true, &e);
         if (!p->slat) { copy_err(err, err_len, "slat_flow: " + e); t2_pipeline_free(p); return nullptr; }
-        p->shapedec = trellis2_shape_dec_load(shape_dec_gguf, true, &e, "cpu");
+        const bool will_cascade = present(slat_hr_flow_gguf);
+
+        // Remember the flow-DiT gguf paths so a GPU decode can free them for VRAM
+        // and reload them next generate (ensure_decode_vram / reload_flows).
+        p->ss_flow_path = ss_flow_gguf ? ss_flow_gguf : "";
+        p->slat_path    = slat_flow_gguf;
+        p->slat_hr_path = will_cascade ? slat_hr_flow_gguf : "";
+
+        // Auto-place the shape (FlexiDualGrid VAE) decoder — the biggest fine-path
+        // stage (~44 s CPU / 59 %). Its mask-based submanifold conv runs ~20x
+        // faster on the GPU (~2 s), but the decode's transient buffers need the
+        // flow DiTs' VRAM freed first (done per-request in ensure_decode_vram).
+        // Put it on the GPU when the card can hold that decode once the flows are
+        // freed — i.e. free_pre_flows covers the tier's decode peak plus the
+        // decoder weights (~1 GB) and a margin. TRELLIS2_SHAPE_DEC_{GPU,CPU}
+        // force it. On the CPU (no GPU) or too small a card it stays on the CPU,
+        // so there is never a mid-generation OOM.
+        bool sd_gpu;
+        if      (std::getenv("TRELLIS2_SHAPE_DEC_CPU")) sd_gpu = false;
+        else if (std::getenv("TRELLIS2_SHAPE_DEC_GPU")) sd_gpu = free_pre_flows > 0;
+        else if (free_pre_flows == 0)                   sd_gpu = false;   // no GPU
+        else {
+            const size_t margin = (size_t) 3 << 29;   // ~1.5 GB (weights + slack)
+            sd_gpu = free_pre_flows >= decode_vram_peak(will_cascade ? T2_PIPE_1024
+                                                                     : T2_PIPE_512) + margin;
+        }
+        p->shapedec = trellis2_shape_dec_load(shape_dec_gguf, true, &e, sd_gpu ? nullptr : "cpu");
+        if (!p->shapedec && sd_gpu) {   // unexpected GPU load OOM — fall back to CPU
+            sd_gpu = false;
+            p->shapedec = trellis2_shape_dec_load(shape_dec_gguf, true, &e, "cpu");
+        }
         if (!p->shapedec) { copy_err(err, err_len, "shape_dec: " + e); t2_pipeline_free(p); return nullptr; }
+        p->shapedec_gpu = sd_gpu;
         p->fine = true;
 
         // The 1024 model is optional; when present the cascade path is enabled
         // and reuses p->shapedec for both the upsample and the 1024^3 decode.
-        if (present(slat_hr_flow_gguf)) {
+        if (will_cascade) {
             p->slat_hr = trellis2_slat_flow_load(slat_hr_flow_gguf, true, &e);
             if (!p->slat_hr) { copy_err(err, err_len, "slat_hr_flow: " + e); t2_pipeline_free(p); return nullptr; }
             p->cascade = true;
@@ -171,6 +253,12 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
                              char * err, int err_len) {
     if (!p) { copy_err(err, err_len, "null pipeline"); return nullptr; }
     std::string e;
+
+    // Reload any flow DiT a previous GPU decode freed for VRAM (usually a no-op).
+    if (!reload_flows(p, e)) {
+        copy_err(err, err_len, "reload flow models: " + e);
+        return nullptr;
+    }
 
     // Resolve the requested path to what is actually loaded.
     int pt = pipeline_type;
@@ -316,6 +404,7 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
     if (pt == T2_PIPE_512) {
         // ── 512 fine: decode the LR slat directly at grid 512 ────────────────
         if (progress) progress(user, T2_STAGE_SHAPE_DEC, 0, 0);
+        ensure_decode_vram(p, T2_PIPE_512);   // free the flow DiTs if a GPU decode needs the room
         if (!trellis2_shape_dec_decode(p->shapedec, slat.data(), L, coords.data(),
                                        dec_feats, dec_coords, nullptr, &e)) {
             copy_err(err, err_len, "shape decode: " + e);
@@ -372,6 +461,7 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         }
 
         if (progress) progress(user, T2_STAGE_SHAPE_DEC_HR, 0, 0);
+        ensure_decode_vram(p, T2_PIPE_1024);   // free the flow DiTs (all done) for the 1024³ decode
         if (!trellis2_shape_dec_decode(p->shapedec, hr_slat.data(), Lhr, hr_coords.data(),
                                        dec_feats, dec_coords, nullptr, &e)) {
             copy_err(err, err_len, "HR shape decode: " + e);
