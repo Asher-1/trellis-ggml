@@ -96,6 +96,14 @@ Runtime on the 16 GB RTX 5070 Ti: coarse ~34 s, fine ~110 s.
   deferred ("initial goal is just the mesh").
 - **Cascade paths** (1024 / 1536 / *_cascade) — only the "512" pipeline type is
   ported. Cascade needs the decoder `.upsample()` coord prediction + HR flow.
+  The VRAM prerequisite is now in place: `sdpa_auto()` in trellis2.cpp uses
+  exact attention for small L and flash attention (`ggml_flash_attn_ext`, O(L)
+  memory) once the score matrix would exceed 1 GiB. Benchmarked: the SLAT flow
+  runs at the full 49,152-token cascade cap on the 16 GB GPU, where exact
+  attention would need a 108 GiB self-attention matrix. Remaining work is the
+  cascade orchestration itself (LR sample → decoder.upsample ×4 → quantize HR
+  coords → resolution-reduce to <max_num_tokens → HR sample with the 1024
+  model), plus model-swapping between LR/HR to reach the <8 GB target.
 - **Background removal** (BiRefNet/RMBG-2.0) — the demo instructs a transparent
   PNG and uses the image as-is otherwise. A separate ~1 GB seg model.
 - **CUDA 3D-conv kernels** — the SS/shape decoders run on CPU because bundled

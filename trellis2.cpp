@@ -408,6 +408,39 @@ bool trellis2_ss_flow_has_tensor(const trellis2_ss_flow_model * m,
 
 namespace {
 
+// Scaled dot-product attention with an automatic flash fallback. q3/k3/v3 are
+// [head_dim, n_head, L]; returns [n_head*head_dim, L_q].
+//
+// Small L uses the exact path (a materialized [L_k, L_q, heads] softmax) — it is
+// bit-faithful to the PyTorch full-softmax reference (validated to ~1e-4 rel-L2
+// on both flow DiTs). Once that score matrix would exceed ~1 GB — i.e. the HR
+// cascade stage's up-to-49k voxels, where it would otherwise be >100 GB — it
+// switches to ggml_flash_attn_ext: tiled online softmax, O(L) memory. Flash
+// costs the GPU's F16-MMA precision (~3e-3 rel-L2 per forward, immaterial to
+// the final mesh) but is the only way the cascade fits in VRAM at all.
+//
+// Both paths return [head_dim, n_head, L_q] before the reshape, so the choice
+// is invisible downstream.
+ggml_tensor * sdpa_auto(ggml_context * ctx, ggml_tensor * q3, ggml_tensor * k3,
+                        ggml_tensor * v3, int C, float scale) {
+    const int64_t Lq = q3->ne[2], Lk = k3->ne[2], H = q3->ne[1];
+    ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q3, 0, 2, 1, 3)); // [hd, Lq, H]
+    ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k3, 0, 2, 1, 3)); // [hd, Lk, H]
+    ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3)); // [hd, Lk, H]
+
+    if (Lq * Lk * H * (int64_t) sizeof(float) > ((int64_t) 1 << 30)) {    // > 1 GiB
+        ggml_tensor * o = ggml_flash_attn_ext(ctx, qp, kp, vp, nullptr, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+        return ggml_reshape_2d(ctx, o, C, o->ne[2]);                      // [C, Lq]
+    }
+    ggml_tensor * sc = ggml_mul_mat(ctx, kp, qp);                         // [Lk, Lq, H]
+    sc = ggml_soft_max_ext(ctx, sc, nullptr, scale, 0.0f);
+    ggml_tensor * vt = ggml_cont(ctx, ggml_permute(ctx, vp, 1, 0, 2, 3)); // [Lk, hd, H]
+    ggml_tensor * o  = ggml_mul_mat(ctx, vt, sc);                         // [hd, Lq, H]
+    o = ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3));                 // [hd, H, Lq]
+    return ggml_reshape_2d(ctx, o, C, o->ne[2]);                          // [C, Lq]
+}
+
 // Sinusoidal timestep embedding (cos|sin), matching TimestepEmbedder.
 std::vector<float> timestep_embedding(float t, int dim) {
     std::vector<float> e((size_t) dim, 0.0f);
@@ -524,17 +557,9 @@ bool trellis2_ss_flow_forward(trellis2_ss_flow_model * m,
     auto qk_norm = [&](ggml_tensor * v3, const std::string & gname) {
         return ggml_mul(ctx, ggml_rms_norm(ctx, v3, 1e-12f), W(gname));
     };
-    // scaled-dot-product attention; q3/k3/v3 are [hd, H, Lq]/[hd, H, Lk].
-    auto sdpa = [&](ggml_tensor * q3, ggml_tensor * k3, ggml_tensor * v3) -> ggml_tensor * {
-        ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q3, 0, 2, 1, 3)); // [hd, Lq, H]
-        ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k3, 0, 2, 1, 3)); // [hd, Lk, H]
-        ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3)); // [hd, Lk, H]
-        ggml_tensor * sc = ggml_mul_mat(ctx, kp, qp);                         // [Lk, Lq, H]
-        sc = ggml_soft_max_ext(ctx, sc, nullptr, attn_scale, 0.0f);
-        ggml_tensor * vt = ggml_cont(ctx, ggml_permute(ctx, vp, 1, 0, 2, 3)); // [Lk, hd, H]
-        ggml_tensor * o  = ggml_mul_mat(ctx, vt, sc);                         // [hd, Lq, H]
-        o = ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3));                 // [hd, H, Lq]
-        return ggml_reshape_2d(ctx, o, C, o->ne[2]);                          // [C, Lq]
+    // scaled-dot-product attention (flash: O(L) memory); q3/k3/v3 are [hd,H,L].
+    auto sdpa = [&](ggml_tensor * q3, ggml_tensor * k3, ggml_tensor * v3) {
+        return sdpa_auto(ctx, q3, k3, v3, C, attn_scale);
     };
 
     const size_t es = sizeof(float);
@@ -1931,16 +1956,8 @@ bool trellis2_slat_flow_forward(trellis2_slat_flow_model * m,
     auto qk_norm = [&](ggml_tensor * v3, const std::string & gname) {
         return ggml_mul(ctx, ggml_rms_norm(ctx, v3, 1e-12f), W(gname));
     };
-    auto sdpa = [&](ggml_tensor * q3, ggml_tensor * k3, ggml_tensor * v3) -> ggml_tensor * {
-        ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q3, 0, 2, 1, 3));
-        ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k3, 0, 2, 1, 3));
-        ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3));
-        ggml_tensor * sc = ggml_mul_mat(ctx, kp, qp);
-        sc = ggml_soft_max_ext(ctx, sc, nullptr, attn_scale, 0.0f);
-        ggml_tensor * vt = ggml_cont(ctx, ggml_permute(ctx, vp, 1, 0, 2, 3));
-        ggml_tensor * o  = ggml_mul_mat(ctx, vt, sc);
-        o = ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3));
-        return ggml_reshape_2d(ctx, o, C, o->ne[2]);
+    auto sdpa = [&](ggml_tensor * q3, ggml_tensor * k3, ggml_tensor * v3) {
+        return sdpa_auto(ctx, q3, k3, v3, C, attn_scale);
     };
 
     const size_t es = sizeof(float);

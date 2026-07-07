@@ -43,6 +43,14 @@ ctest --test-dir build                  # full parity (needs ggufs/ + dumps/)
 | dual-grid mesh extraction | `test_marching_cubes` (invariants) + visual | watertight-manifold, Euler characteristic, winding | **PASS** |
 
 Notes:
+- **Hybrid attention.** `sdpa_auto()` uses exact materialized-softmax attention
+  while the `[L_k, L_q, heads]` score matrix stays under 1 GiB (everything in
+  the 512 tier — SS-flow 4096 tokens, SLAT ≤~2300 voxels — so the tap parity
+  above is the exact path), and switches to `ggml_flash_attn_ext` above that.
+  Flash is bit-faithful to full softmax on CPU (SS-flow 2.4e-4, SLAT 2.9e-4 —
+  identical to exact) but incurs ~3e-3 rel-L2 on the CUDA F16-MMA kernel. It is
+  what makes the HR cascade fit: benchmarked OK at the full 49,152-token cap on
+  16 GB, versus a 108 GiB exact self-attention matrix.
 - **TF32 matters.** PyTorch's default CUDA matmul/attention uses TF32 (≈10-bit
   mantissa) and reduced-precision flash SDPA, which shows up as ~1e-3 relative
   error versus true fp32. `scripts/ref_common.py` disables it so the golden
