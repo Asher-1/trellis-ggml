@@ -2359,9 +2359,13 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         cap(name, c4.data(), c4.size());
     };
 
-    // subdiv logits + conv1 output + pre-up x of the previous level, needed to
-    // seed the next level's head graph.
-    std::vector<float> up_h1, up_x, up_subdiv;
+    // The previous up-block's outputs, already gathered down to the surviving
+    // children (see the host_gather at the bottom of the loop): up_hch is the
+    // conv1 output [C_next, L_child], up_xch the skip source [C/8, L_child].
+    // Pre-gathering here — instead of reading back the full [C_next*8, L] conv
+    // output and gathering in the next graph — keeps the finest level's ~8 GB
+    // conv output from being duplicated in host RAM.
+    std::vector<float> up_hch, up_xch, up_subdiv;
     int prev_C = 0, prev_L = 0;
 
     for (int lvl = 0; lvl < n_levels; ++lvl) {
@@ -2448,7 +2452,7 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         };
 
         ggml_tensor * h = nullptr;
-        ggml_tensor * in_a = nullptr, * in_h1 = nullptr, * in_x = nullptr, * cidx_t = nullptr;
+        ggml_tensor * in_a = nullptr, * in_hch = nullptr, * in_xch = nullptr;
 
         if (lvl == 0) {
             // from_latent on the input slat
@@ -2456,29 +2460,24 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
             ggml_set_input(in_a);
             h = lin(in_a, "from_latent");
         } else {
-            // child head of the previous level's up-block:
-            //   h_child = gather(conv1_out slices) ; x_child = gather(x slices)
-            //   h = conv2(silu(LN_free(h_child))) + repeat_interleave(x_child)
+            // child head of the previous level's up-block. The surviving
+            // children were already gathered on host (up_hch/up_xch), so we
+            // receive hch [C, L] and xch [prev_C/8, L] directly — no on-device
+            // get_rows over the full [C*8, prev_L]:
+            //   h = conv2(silu(LN_free(hch))) + repeat_interleave(xch)
             const std::string up = "blocks." + std::to_string(lvl - 1) + "." +
                                    std::to_string(hp.num_blocks[lvl - 1]);
-            in_h1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) C * 8, prev_L);
-            in_x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, prev_C, prev_L);
-            cidx_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
-            ggml_set_input(in_h1);
-            ggml_set_input(in_x);
-            ggml_set_input(cidx_t);
-
-            ggml_tensor * hch = ggml_get_rows(ctx,
-                ggml_reshape_2d(ctx, in_h1, C, (int64_t) 8 * prev_L), cidx_t);   // [C, L]
-            ggml_tensor * xch = ggml_get_rows(ctx,
-                ggml_reshape_2d(ctx, in_x, prev_C / 8, (int64_t) 8 * prev_L), cidx_t); // [prev_C/8, L]
+            in_hch = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, L);            // hch
+            in_xch = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, prev_C / 8, L);   // xch
+            ggml_set_input(in_hch);
+            ggml_set_input(in_xch);
 
             const int r = C / (prev_C / 8);   // repeat_interleave factor
-            ggml_tensor * skip = ggml_reshape_3d(ctx, xch, 1, prev_C / 8, L);
+            ggml_tensor * skip = ggml_reshape_3d(ctx, in_xch, 1, prev_C / 8, L);
             skip = ggml_repeat(ctx, skip, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, r, prev_C / 8, L));
             skip = ggml_reshape_2d(ctx, skip, C, L);
 
-            ggml_tensor * hn = ggml_norm(ctx, hch, eps);      // norm2, affine-free
+            ggml_tensor * hn = ggml_norm(ctx, in_hch, eps);   // norm2, affine-free
             hn = ggml_silu(ctx, hn);
             hn = conv(hn, up + ".conv2");
             h = ggml_add(ctx, hn, skip);
@@ -2537,21 +2536,9 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         if (lvl == 0) {
             ggml_backend_tensor_set(in_a, slat, 0, (size_t) hp.latent_channels * L * es);
         } else {
-            ggml_backend_tensor_set(in_h1, up_h1.data(), 0, up_h1.size() * es);
-            ggml_backend_tensor_set(in_x,  up_x.data(),  0, up_x.size() * es);
-            // child gather indices were stashed in up_subdiv's reuse below
-            std::vector<int32_t> cidx((size_t) L);
-            {
-                int w = 0;
-                for (int v = 0; v < prev_L; ++v) {
-                    for (int o = 0; o < 8; ++o) {
-                        if (up_subdiv[(size_t) v * 8 + o] > 0.0f) {
-                            cidx[(size_t) w++] = o + 8 * v;
-                        }
-                    }
-                }
-            }
-            ggml_backend_tensor_set(cidx_t, cidx.data(), 0, (size_t) L * sizeof(int32_t));
+            // pre-gathered by the previous level (host_gather below)
+            ggml_backend_tensor_set(in_hch, up_hch.data(), 0, up_hch.size() * es);
+            ggml_backend_tensor_set(in_xch, up_xch.data(), 0, up_xch.size() * es);
         }
 
         const ggml_status st = ggml_backend_graph_compute(m->backend, gf);
@@ -2574,37 +2561,65 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         }
 
         if (has_up) {
+            // Read only the subdivision logits (small) up front.
             up_subdiv.resize((size_t) 8 * L);
-            up_h1.resize((size_t) C_next * 8 * L);
-            up_x.resize((size_t) C * L);
+            ggml_tensor * h1_o = nullptr, * x_o = nullptr;
             for (auto & o : outs) {
                 if (o.first == "subdiv") ggml_backend_tensor_get(o.second, up_subdiv.data(), 0, up_subdiv.size() * es);
-                if (o.first == "h1")     ggml_backend_tensor_get(o.second, up_h1.data(),     0, up_h1.size() * es);
-                if (o.first == "x")      ggml_backend_tensor_get(o.second, up_x.data(),      0, up_x.size() * es);
+                if (o.first == "h1")     h1_o = o.second;
+                if (o.first == "x")      x_o  = o.second;
             }
             if (taps) cap("lvl" + std::to_string(lvl) + ".subdiv", up_subdiv.data(), up_subdiv.size());
 
-            // host: expand to child coords
-            std::vector<int32_t> child_coords;
-            child_coords.reserve((size_t) L * 3 * 4);
+            // Expand to child coords and, in the same pass, the gather index
+            // (surviving child slot o + 8*v, in [0, 8L)).
+            std::vector<int32_t> child_coords, cidx;
+            child_coords.reserve((size_t) L * 3);
+            cidx.reserve((size_t) L);
             for (int v = 0; v < L; ++v) {
                 for (int o = 0; o < 8; ++o) {
                     if (up_subdiv[(size_t) v * 8 + o] > 0.0f) {
+                        cidx.push_back(o + 8 * v);
                         child_coords.push_back(2 * coords[(size_t) v * 3]     + (o & 1));
                         child_coords.push_back(2 * coords[(size_t) v * 3 + 1] + ((o >> 1) & 1));
                         child_coords.push_back(2 * coords[(size_t) v * 3 + 2] + ((o >> 2) & 1));
                     }
                 }
             }
-            prev_C = C;
-            prev_L = L;
-            coords = std::move(child_coords);
-            L = (int) (coords.size() / 3);
-            if (L == 0) {
+            const int L_child = (int) cidx.size();
+            if (L_child == 0) {
                 set_error(error, "subdivision predicted no children at level " + std::to_string(lvl));
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
             }
+
+            // Gather the surviving children of h1 [C_next*8, L] (viewed as
+            // [C_next, 8L]) and x [C, L] (viewed as [C/8, 8L]) — byte-identical
+            // to get_rows(cidx) on the reshaped tensors. On the CPU backend the
+            // conv output is already in host memory, so we read it in place
+            // instead of duplicating the full [C_next*8, L] (~8 GB at 1024^3).
+            auto host_gather = [&](ggml_tensor * t, int chans, std::vector<float> & out) {
+                out.resize((size_t) chans * L_child);
+                if (t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                    const float * d = (const float *) t->data;
+                    for (int j = 0; j < L_child; ++j)
+                        std::memcpy(out.data() + (size_t) j * chans,
+                                    d + (size_t) cidx[(size_t) j] * chans, (size_t) chans * es);
+                } else {
+                    std::vector<float> full((size_t) ggml_nelements(t));
+                    ggml_backend_tensor_get(t, full.data(), 0, full.size() * es);
+                    for (int j = 0; j < L_child; ++j)
+                        std::memcpy(out.data() + (size_t) j * chans,
+                                    full.data() + (size_t) cidx[(size_t) j] * chans, (size_t) chans * es);
+                }
+            };
+            host_gather(h1_o, C_next, up_hch);   // [C_next, L_child]
+            host_gather(x_o,  C / 8,  up_xch);   // [C/8,     L_child]
+
+            prev_C = C;
+            prev_L = L;
+            coords = std::move(child_coords);
+            L = L_child;
         } else {
             out_feats.resize((size_t) hp.out_channels * L);
             for (auto & o : outs) {
