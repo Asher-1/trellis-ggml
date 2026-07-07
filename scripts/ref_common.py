@@ -84,15 +84,22 @@ def _install_sdpa_sparse_attention():
     from trellis2.modules.sparse import VarLenTensor
 
     def sdpa_varlen(q, k, v, q_seqlen, kv_seqlen):
-        # q: [Tq, H, C], k/v: [Tkv, H, C] concatenated over batch
+        # q: [Tq, H, C], k/v: [Tkv, H, C] concatenated over batch. Query-chunked
+        # so the [H, chunk, L] score matrix stays bounded — the math SDPA backend
+        # (forced for true fp32) would otherwise OOM at the cascade's HR token
+        # counts. Chunking queries is mathematically exact (each query's softmax
+        # is independent), so the golden values are unchanged.
+        CHUNK = 2048
         out = torch.empty_like(q)
         qo = ko = 0
         for ql, kl in zip(q_seqlen, kv_seqlen):
-            qs = q[qo:qo + ql].transpose(0, 1).unsqueeze(0)  # [1,H,L,C]
-            ks = k[ko:ko + kl].transpose(0, 1).unsqueeze(0)
+            ks = k[ko:ko + kl].transpose(0, 1).unsqueeze(0)  # [1,H,kl,C]
             vs = v[ko:ko + kl].transpose(0, 1).unsqueeze(0)
-            o = F.scaled_dot_product_attention(qs, ks, vs)
-            out[qo:qo + ql] = o.squeeze(0).transpose(0, 1)
+            for s in range(0, ql, CHUNK):
+                e = min(s + CHUNK, ql)
+                qs = q[qo + s:qo + e].transpose(0, 1).unsqueeze(0)  # [1,H,chunk,C]
+                o = F.scaled_dot_product_attention(qs, ks, vs)
+                out[qo + s:qo + e] = o.squeeze(0).transpose(0, 1)
             qo += ql
             ko += kl
         return out

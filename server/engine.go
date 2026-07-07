@@ -12,7 +12,7 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-const abiVersion = 1
+const abiVersion = 2
 
 // Progress stages (enum t2_stage).
 const (
@@ -23,6 +23,9 @@ const (
 	stageSLATFlow   = 4
 	stageShapeDec   = 5
 	stageMesh       = 6
+	stageUpsample   = 7
+	stageSLATFlowHR = 8
+	stageShapeDecHR = 9
 )
 
 var stageNames = map[int]string{
@@ -33,7 +36,22 @@ var stageNames = map[int]string{
 	stageSLATFlow:   "sampling shape SLAT",
 	stageShapeDec:   "decoding shape",
 	stageMesh:       "extracting mesh",
+	stageUpsample:   "upsampling scaffold",
+	stageSLATFlowHR: "sampling shape SLAT (1024)",
+	stageShapeDecHR: "decoding shape (1024)",
 }
+
+// Pipeline types (enum t2_pipeline_type) and capability bits (enum t2_caps).
+const (
+	pipeAuto   = 0
+	pipeCoarse = 1
+	pipe512    = 2
+	pipe1024   = 3
+
+	capCoarse = 1
+	cap512    = 2
+	cap1024   = 4
+)
 
 type engine struct {
 	// inference is not thread-safe: one generation at a time.
@@ -41,14 +59,14 @@ type engine struct {
 
 	pipeline uintptr
 	backend  string
-	fine     bool
+	caps     int // bitmask of t2_caps
 
 	abiVersion      func() int32
-	pipelineLoad    func(dino, flow, dec, slat, shapeDec string, err unsafe.Pointer, errLen int32) uintptr
+	pipelineLoad    func(dino, flow, dec, slat, slatHR, shapeDec string, flags int32, err unsafe.Pointer, errLen int32) uintptr
 	pipelineFree    func(p uintptr)
 	pipelineBackend func(p uintptr) string
-	pipelineIsFine  func(p uintptr) int32
-	generate        func(p uintptr, img unsafe.Pointer, imgLen int32, seed uint64,
+	pipelineCaps    func(p uintptr) int32
+	generate        func(p uintptr, img unsafe.Pointer, imgLen int32, pipelineType int32, seed uint64,
 		steps int32, guidance float32, cb uintptr, user unsafe.Pointer,
 		err unsafe.Pointer, errLen int32) uintptr
 	meshNVerts   func(r uintptr) int32
@@ -69,8 +87,9 @@ var (
 
 var progressCallback uintptr // created once; purego callbacks are permanent
 
-// slatGGUF and shapeDecGGUF may be "" to run the coarse (marching-cubes) path.
-func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, shapeDecGGUF string) (*engine, error) {
+// slatGGUF/shapeDecGGUF may be "" for the coarse path; slatHRGGUF may be "" to
+// disable the 1024 cascade (512 fine only).
+func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shapeDecGGUF string) (*engine, error) {
 	lib, err := purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
 	if err != nil {
 		return nil, fmt.Errorf("dlopen %s: %w", libPath, err)
@@ -84,7 +103,7 @@ func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, shapeDecGGUF stri
 	purego.RegisterLibFunc(&e.pipelineLoad, lib, "t2_pipeline_load")
 	purego.RegisterLibFunc(&e.pipelineFree, lib, "t2_pipeline_free")
 	purego.RegisterLibFunc(&e.pipelineBackend, lib, "t2_pipeline_backend")
-	purego.RegisterLibFunc(&e.pipelineIsFine, lib, "t2_pipeline_is_fine")
+	purego.RegisterLibFunc(&e.pipelineCaps, lib, "t2_pipeline_caps")
 	purego.RegisterLibFunc(&e.generate, lib, "t2_generate")
 	purego.RegisterLibFunc(&e.meshNVerts, lib, "t2_mesh_n_verts")
 	purego.RegisterLibFunc(&e.meshNTris, lib, "t2_mesh_n_tris")
@@ -106,14 +125,14 @@ func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, shapeDecGGUF stri
 	}
 
 	errBuf := make([]byte, 512)
-	p := e.pipelineLoad(dinoGGUF, flowGGUF, decGGUF, slatGGUF, shapeDecGGUF,
-		unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
+	p := e.pipelineLoad(dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shapeDecGGUF,
+		0 /*flags*/, unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
 	if p == 0 {
 		return nil, fmt.Errorf("pipeline load: %s", cstr(errBuf))
 	}
 	e.pipeline = p
 	e.backend = e.pipelineBackend(p)
-	e.fine = e.pipelineIsFine(p) != 0
+	e.caps = int(e.pipelineCaps(p))
 	return e, nil
 }
 
@@ -126,7 +145,7 @@ type meshData struct {
 }
 
 // Generate runs the full image->mesh pipeline. onProgress may be nil.
-func (e *engine) Generate(image []byte, seed uint64, steps int, guidance float32,
+func (e *engine) Generate(image []byte, pipelineType int, seed uint64, steps int, guidance float32,
 	onProgress func(stage, step, total int)) (*meshData, error) {
 
 	e.mu.Lock()
@@ -147,7 +166,7 @@ func (e *engine) Generate(image []byte, seed uint64, steps int, guidance float32
 	}
 
 	errBuf := make([]byte, 512)
-	r := e.generate(e.pipeline, unsafe.Pointer(&image[0]), int32(len(image)),
+	r := e.generate(e.pipeline, unsafe.Pointer(&image[0]), int32(len(image)), int32(pipelineType),
 		seed, int32(steps), guidance, cb, nil,
 		unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
 	if r == 0 {

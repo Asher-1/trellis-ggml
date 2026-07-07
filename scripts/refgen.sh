@@ -22,5 +22,6 @@ run python tests/ref_ss_flow.py                 # CPU (true fp32 golden)
 run python tests/ref_ss_sample.py --device cuda
 run python tests/ref_ss_dec.py --device cuda
 run python scripts/dump_slat_reference.py --device cuda  # TF32 disabled in ref_common
+run python scripts/dump_cascade_reference.py --device cuda  # 1024 HR stage
 echo "reference dumps regenerated:"
 ls -la "$ROOT/dumps" "$ROOT"/tests/*.bin

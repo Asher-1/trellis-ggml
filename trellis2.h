@@ -417,6 +417,18 @@ trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
                           trellis2_shape_dec_taps * taps = nullptr,
                           std::string * error = nullptr);
 
+// Predict just the subdivided coordinate set after `upsample_times` levels,
+// without running the output layer — mirrors FlexiDualGridVaeDecoder.upsample(),
+// used by the 1024 cascade to turn the LR (32^3) scaffold into candidate coords.
+//   upsample_times : in [1, n_levels-1] (4 for the cascade: 32^3 -> 512^3)
+//   out_coords     : filled with [L_out * 3] int32 at input_res * 2^upsample_times
+TRELLIS2_API bool
+trellis2_shape_dec_upsample(trellis2_shape_dec_model * m,
+                            const float * slat, int n_voxels, const int32_t * coords,
+                            int upsample_times,
+                            std::vector<int32_t> & out_coords,
+                            std::string * error = nullptr);
+
 /*****************************************************************************
 ** Public API – DINOv3 ViT-L/16 image-conditioning encoder
 **

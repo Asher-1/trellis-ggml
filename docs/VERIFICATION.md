@@ -41,6 +41,9 @@ ctest --test-dir build                  # full parity (needs ggufs/ + dumps/)
 | shape-SLAT flow forward | `test_slat` | full output | **PASS**, rel-L2 2.9e-4 (CPU) / 8e-4 (GPU) |
 | shape-SLAT VAE decoder (sparse ConvNeXt U-Net, 4 levels, 16× up) | `test_slat` | per-level features + subdivision logits + final 7-ch output, all 5 levels | **PASS**, rel-L2 ≤ 6e-7 (levels 0–3 exact; final set within 0.0001%) |
 | dual-grid mesh extraction | `test_marching_cubes` (invariants) + visual | watertight-manifold, Euler characteristic, winding | **PASS** |
+| **1024 cascade** — decoder upsample(×4) → 512³ coords | `test_cascade` | full coord set + quantized 64³ HR scaffold | **PASS**, set match to 0.0001% (1 voxel of 995k) |
+| **1024 cascade** — HR (1024-model) flow forward | `test_cascade` | full output | **PASS**, rel-L2 ~3e-4 (CPU); ~1e-2 on GPU flash |
+| **1024 cascade** — final 1024³ decode (3.97M voxels) | `test_cascade` | per-level features + subdivision + 7-ch output | **PASS**, rel-L2 ≤ 2e-2, set within 0.0001% |
 
 Notes:
 - **Hybrid attention.** `sdpa_auto()` uses exact materialized-softmax attention

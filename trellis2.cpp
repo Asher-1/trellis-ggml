@@ -2311,12 +2311,18 @@ void build_neighbor_indices(const std::vector<int32_t> & coords, int L,
 
 } // namespace
 
-bool trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
-                               const float * slat, int n_voxels, const int32_t * coords_in,
-                               std::vector<float> & out_feats,
-                               std::vector<int32_t> & out_coords,
-                               trellis2_shape_dec_taps * taps,
-                               std::string * error) {
+// Shared driver for the shape decoder. upsample_times < 0 runs the full decode
+// (all levels + output layer; fills out_feats and out_coords) — the validated
+// behavior. upsample_times in [1, n_levels-1] runs only that many subdivision
+// levels and returns the expanded coordinate set in out_coords (out_feats
+// untouched) — mirrors FlexiDualGridVaeDecoder.upsample().
+static bool shape_dec_run(trellis2_shape_dec_model * m,
+                          const float * slat, int n_voxels, const int32_t * coords_in,
+                          int upsample_times,
+                          std::vector<float> & out_feats,
+                          std::vector<int32_t> & out_coords,
+                          trellis2_shape_dec_taps * taps,
+                          std::string * error) {
     if (!m)           { set_error(error, "null model"); return false; }
     if (!m->has_data) { set_error(error, "model loaded metadata-only; reload with load_tensors=true"); return false; }
 
@@ -2324,6 +2330,11 @@ bool trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
     const int n_levels = hp.n_levels;
     const float eps = hp.norm_eps;
     const size_t es = sizeof(float);
+
+    if (upsample_times >= 0 && (upsample_times < 1 || upsample_times > n_levels - 1)) {
+        set_error(error, "upsample_times out of range [1, n_levels-1]");
+        return false;
+    }
 
     std::string missing;
 
@@ -2610,7 +2621,35 @@ bool trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
 
         ggml_gallocr_free(alloc);
         ggml_free(ctx);
+
+        // upsample-to-level-N: at this point `coords` holds the child set this
+        // level's up-block produced (has_up is always true for lvl < n_levels-1,
+        // which upsample_times-1 always is), so return it and skip the rest.
+        if (upsample_times >= 0 && lvl == upsample_times - 1) {
+            out_coords = coords;
+            return true;
+        }
     }
 
     return true;
+}
+
+bool trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
+                               const float * slat, int n_voxels, const int32_t * coords_in,
+                               std::vector<float> & out_feats,
+                               std::vector<int32_t> & out_coords,
+                               trellis2_shape_dec_taps * taps,
+                               std::string * error) {
+    return shape_dec_run(m, slat, n_voxels, coords_in, /*upsample_times*/ -1,
+                         out_feats, out_coords, taps, error);
+}
+
+bool trellis2_shape_dec_upsample(trellis2_shape_dec_model * m,
+                                 const float * slat, int n_voxels, const int32_t * coords,
+                                 int upsample_times,
+                                 std::vector<int32_t> & out_coords,
+                                 std::string * error) {
+    std::vector<float> unused;
+    return shape_dec_run(m, slat, n_voxels, coords, upsample_times,
+                         unused, out_coords, /*taps*/ nullptr, error);
 }

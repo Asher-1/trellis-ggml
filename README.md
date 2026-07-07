@@ -30,10 +30,15 @@ docker run --rm --device nvidia.com/gpu=all -v "$PWD":/work -w /work/server -p 8
 # open http://localhost:8742 , drop an image (transparent background works best)
 ```
 
-Drop the shape-SLAT models (`-coarse`, or omit `slat_flow`/`shape_dec` GGUFs)
-to fall back to the fast 64³ marching-cubes preview. On a 16 GB RTX 50-series
-the full fine path (1.3B SS-flow + 1.3B shape-SLAT + sparse U-Net decoder)
-runs image→mesh in ~110 s and yields a ~1M-vertex 512³ dual-grid mesh.
+The browser UI has a **quality** selector: coarse preview (64³ marching cubes),
+512³ fine, or **1024³ cascade** (the TRELLIS.2 default — sharpest). Coarse falls
+back automatically if the shape-SLAT models are absent (`-coarse`); the 1024
+cascade needs the extra 1024 model (`-no-1024` disables it).
+
+On a 16 GB RTX 50-series: the 512 fine path runs image→mesh in ~110 s (~1M-vertex
+512³ mesh); the 1024 cascade adds a second 1.3B-model pass and the 1024³ decoder
+for a ~5M-vertex mesh (~5 min, ~10 GB VRAM, and a ~14 GB host-RAM spike for the
+1024³ sparse-conv decode).
 
 ## Pipeline
 
@@ -47,6 +52,13 @@ image (RGBA)
   → shape VAE decoder   sparse ConvNeXt U-Net, 16× up → 512³ dual-grid fields [C++/ggml]
   → flexible dual grid  → triangle mesh                                       [C++]
 ```
+
+The **1024 cascade** (default in TRELLIS.2) adds a second pass on top: the 512
+result's decoder `.upsample(×4)` predicts a denser coordinate scaffold, which is
+quantized to 64³ and fed to a second 1.3B shape-SLAT flow (the 1024 model,
+conditioned on a 1024-res DINOv3 encode) and the same decoder at 1024³ — a
+~5M-vertex mesh. The ~49k-token HR attention only fits in VRAM via flash
+attention (`sdpa_auto`); see [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 Every stage is validated tap-by-tap against the PyTorch reference — see
 [docs/VERIFICATION.md](docs/VERIFICATION.md). Highlights: preprocessing is

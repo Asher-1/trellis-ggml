@@ -79,6 +79,10 @@
       <small>best: subject on a transparent background (PNG/WebP)</small></span>
     </div>
     <input id="file" type="file" accept="image/*" hidden>
+    <div>
+      <label for="quality">quality</label>
+      <select id="quality" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--edge);border-radius:6px;padding:6px 8px"></select>
+    </div>
     <div class="row">
       <div><label for="seed">seed</label><input id="seed" type="number" value="42" min="0"></div>
       <div><label for="steps">steps</label><input id="steps" type="number" value="12" min="1" max="50"></div>
@@ -108,8 +112,22 @@
 const $ = id => document.getElementById(id);
 let imageBlob = null;
 
+const QUALITY_LABELS = {
+  coarse: "coarse preview (64³, fast)",
+  "512":  "512³ fine",
+  "1024": "1024³ cascade (sharpest, slow)",
+};
 fetch("/api/info").then(r => r.json())
-  .then(i => { $("backend").textContent = i.backend; })
+  .then(i => {
+    $("backend").textContent = i.backend;
+    const sel = $("quality");
+    (i.qualities || ["coarse"]).forEach(q => {
+      const o = document.createElement("option");
+      o.value = q; o.textContent = QUALITY_LABELS[q] || q;
+      if (q === i.best) o.selected = true;
+      sel.appendChild(o);
+    });
+  })
   .catch(() => { $("backend").textContent = "?"; });
 
 function setStatus(msg, isErr) {
@@ -166,6 +184,7 @@ $("go").addEventListener("click", async () => {
 
   const fd = new FormData();
   fd.append("image", imageBlob, "input.png");
+  fd.append("quality", $("quality").value);
   fd.append("seed", $("seed").value);
   fd.append("steps", $("steps").value);
   fd.append("guidance", $("guidance").value);
@@ -183,10 +202,12 @@ $("go").addEventListener("click", async () => {
 });
 
 async function poll(id) {
-  // stage weights for a smooth-ish progress bar (fine path has 7 stages)
-  const stageBase = { "preprocess": 2, "encoding image (DINOv3)": 5,
-                      "sampling sparse structure": 10, "decoding occupancy": 40,
-                      "sampling shape SLAT": 45, "decoding shape": 85,
+  // stage weights for a smooth-ish progress bar (coarse/fine/cascade)
+  const stageBase = { "preprocess": 2, "encoding image (DINOv3)": 4,
+                      "sampling sparse structure": 8, "decoding occupancy": 22,
+                      "sampling shape SLAT": 26, "decoding shape": 40,
+                      "upsampling scaffold": 42,
+                      "sampling shape SLAT (1024)": 46, "decoding shape (1024)": 88,
                       "extracting mesh": 95 };
   for (;;) {
     const r = await fetch("/api/job/" + id);
@@ -204,9 +225,11 @@ async function poll(id) {
     if (j.state === "running" && j.stage) {
       let pct = stageBase[j.stage] ?? 5;
       if (j.stage === "sampling sparse structure" && j.total > 0)
-        pct = 10 + 28 * (j.step / j.total);
+        pct = 8 + 14 * (j.step / j.total);
       if (j.stage === "sampling shape SLAT" && j.total > 0)
-        pct = 45 + 38 * (j.step / j.total);
+        pct = 26 + 14 * (j.step / j.total);
+      if (j.stage === "sampling shape SLAT (1024)" && j.total > 0)
+        pct = 46 + 42 * (j.step / j.total);
       $("bar").firstElementChild.style.width = pct + "%";
       setStatus(j.stage + (j.total ? ` (${j.step}/${j.total})` : "") + "…");
     } else {

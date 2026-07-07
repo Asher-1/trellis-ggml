@@ -105,6 +105,23 @@ def main():
     print(f"cond: shape={tuple(cond_np.shape)} mean={cond_np.mean():.6f} "
           f"min={cond_np.min():.4f} max={cond_np.max():.4f} l2={np.linalg.norm(cond_np):.4f}")
 
+    # Also emit the 1024-resolution conditioning (4101 tokens) that the HR stage
+    # of the 1024 cascade consumes. Same encode path, image_size 1024.
+    resized_hr = pre.resize((1024, 1024), Image.Resampling.LANCZOS)
+    xhr = np.array(resized_hr).astype(np.float32) / 255.0
+    xhr = torch.from_numpy(xhr).permute(2, 0, 1).unsqueeze(0)
+    pv_hr = ((xhr - mean) / std).to(args.device)
+    with torch.no_grad():
+        h = model.embeddings(pv_hr, bool_masked_pos=None)
+        rope_hr = model.rope_embeddings(pv_hr)
+        for layer_module in model.layer:
+            h = layer_module(h, position_embeddings=rope_hr)
+            if isinstance(h, tuple):
+                h = h[0]
+        cond_hr = F.layer_norm(h, h.shape[-1:]).cpu().numpy().astype(np.float32)
+    ref_common.write_dinodata(os.path.join(ref_common.DUMPS, "fixture_1024.dinodata"), cond_hr)
+    print(f"cond_1024: shape={tuple(cond_hr.shape)} l2={np.linalg.norm(cond_hr):.4f}")
+
     import gguf
     writer = gguf.GGUFWriter(args.out, "reference")
     manifest = {"resolution": args.resolution, "atol": 2e-3, "rtol": 2e-3, "shapes": {}}

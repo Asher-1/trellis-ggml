@@ -34,6 +34,8 @@ fetch $T2 ckpts/ss_flow_img_dit_1_3B_64_bf16.json                TRELLIS.2-4B
 fetch $T2 ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors         TRELLIS.2-4B
 fetch $T2 ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.json       TRELLIS.2-4B
 fetch $T2 ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors TRELLIS.2-4B
+fetch $T2 ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.json       TRELLIS.2-4B
+fetch $T2 ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors TRELLIS.2-4B
 fetch $T2 ckpts/shape_dec_next_dc_f16c32_fp16.json               TRELLIS.2-4B
 fetch $T2 ckpts/shape_dec_next_dc_f16c32_fp16.safetensors        TRELLIS.2-4B
 fetch $T1 ckpts/ss_dec_conv3d_16l8_fp16.json                     TRELLIS-image-large

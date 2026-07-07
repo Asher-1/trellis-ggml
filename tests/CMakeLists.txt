@@ -32,6 +32,12 @@ add_executable(test_slat test_slat.cpp)
 target_link_libraries(test_slat PRIVATE trellis2)
 target_compile_features(test_slat PRIVATE cxx_std_14)
 
+# 1024_cascade HR-stage parity vs the PyTorch reference
+# (scripts/dump_cascade_reference.py -> dumps/reference_cascade.gguf).
+add_executable(test_cascade test_cascade.cpp)
+target_link_libraries(test_cascade PRIVATE trellis2)
+target_compile_features(test_cascade PRIVATE cxx_std_14)
+
 # Self-contained isosurface extractor (examples/marching_cubes.h) on analytic
 # fields — watertight-manifold + Euler-characteristic invariants. No model.
 add_executable(test_marching_cubes test_marching_cubes.cpp)
@@ -80,3 +86,8 @@ add_test(NAME slat COMMAND test_slat
          "${T2_DUMPS}/reference_slat.gguf")
 set_tests_properties(slat PROPERTIES SKIP_RETURN_CODE 77 LABELS "model;slow"
                      ENVIRONMENT "TRELLIS2_DINODATA=${T2_DUMPS}/fixture.dinodata")
+
+add_test(NAME cascade COMMAND test_cascade
+         "${T2_GGUFS}/slat_flow_f32.gguf" "${T2_GGUFS}/slat_flow_1024_f32.gguf"
+         "${T2_GGUFS}/shape_dec_f32.gguf" "${T2_DUMPS}/reference_cascade.gguf")
+set_tests_properties(cascade PROPERTIES SKIP_RETURN_CODE 77 LABELS "model;slow")

@@ -45,6 +45,7 @@ type job struct {
 	Error string `json:"error,omitempty"`
 
 	image    []byte
+	pipeline int
 	seed     uint64
 	steps    int
 	guidance float32
@@ -64,7 +65,7 @@ func (s *server) worker() {
 		j.State = "running"
 		j.mu.Unlock()
 
-		mesh, err := s.eng.Generate(j.image, j.seed, j.steps, j.guidance,
+		mesh, err := s.eng.Generate(j.image, j.pipeline, j.seed, j.steps, j.guidance,
 			func(stage, step, total int) {
 				j.mu.Lock()
 				j.Stage = stageNames[stage]
@@ -108,10 +109,22 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// quality: "coarse" | "512" | "1024" (default auto → best available)
+	pt := pipeAuto
+	switch r.FormValue("quality") {
+	case "coarse":
+		pt = pipeCoarse
+	case "512":
+		pt = pipe512
+	case "1024":
+		pt = pipe1024
+	}
+
 	j := &job{
 		ID:       fmt.Sprintf("%08x", rand.Uint32()),
 		State:    "queued",
 		image:    img,
+		pipeline: pt,
 		seed:     formUint(r, "seed", rand.Uint64()%1_000_000),
 		steps:    int(formUint(r, "steps", 12)),
 		guidance: formFloat(r, "guidance", 7.5),
@@ -182,13 +195,23 @@ func (s *server) handleMesh(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
-	mesh := "coarse"
-	if s.eng.fine {
-		mesh = "fine"
+	qualities := []string{"coarse"}
+	if s.eng.caps&cap512 != 0 {
+		qualities = append(qualities, "512")
+	}
+	if s.eng.caps&cap1024 != 0 {
+		qualities = append(qualities, "1024")
+	}
+	best := "coarse"
+	if s.eng.caps&cap1024 != 0 {
+		best = "1024"
+	} else if s.eng.caps&cap512 != 0 {
+		best = "512"
 	}
 	writeJSON(w, map[string]interface{}{
-		"backend": s.eng.backend,
-		"mesh":    mesh,
+		"backend":   s.eng.backend,
+		"qualities": qualities,
+		"best":      best,
 		"defaults": map[string]interface{}{
 			"steps":    12,
 			"guidance": 7.5,
@@ -230,9 +253,11 @@ func main() {
 	dino := flag.String("dino", "", "dino gguf (default <ggufs>/dino_f16.gguf)")
 	flow := flag.String("flow", "", "ss_flow gguf (default <ggufs>/ss_flow_f16.gguf)")
 	dec := flag.String("dec", "", "ss_dec gguf (default <ggufs>/ss_dec_f16.gguf)")
-	slat := flag.String("slat", "", "shape-slat flow gguf (default <ggufs>/slat_flow_f16.gguf)")
+	slat := flag.String("slat", "", "512 shape-slat flow gguf (default <ggufs>/slat_flow_f16.gguf)")
+	slatHR := flag.String("slat-hr", "", "1024 shape-slat flow gguf (default <ggufs>/slat_flow_1024_f16.gguf)")
 	shapeDec := flag.String("shape-dec", "", "shape decoder gguf (default <ggufs>/shape_dec_f16.gguf)")
 	coarse := flag.Bool("coarse", false, "coarse marching-cubes path only (skip shape-SLAT models)")
+	no1024 := flag.Bool("no-1024", false, "disable the 1024 cascade (512 fine max)")
 	addr := flag.String("addr", ":8742", "listen address")
 	flag.Parse()
 
@@ -242,29 +267,37 @@ func main() {
 		}
 		return filepath.Join(*ggufDir, name)
 	}
-	// The fine (dual-grid) path needs the two shape-SLAT models; if either is
-	// missing on disk, fall back to the coarse path automatically.
-	slatPath, shapePath := "", ""
+	// The fine (dual-grid) path needs the two shape-SLAT models; the 1024 cascade
+	// additionally needs the 1024 model. Missing files degrade gracefully.
+	slatPath, shapePath, slatHRPath := "", "", ""
 	if !*coarse {
 		slatPath = pick(*slat, "slat_flow_f16.gguf")
 		shapePath = pick(*shapeDec, "shape_dec_f16.gguf")
 		if !fileExists(slatPath) || !fileExists(shapePath) {
 			log.Printf("shape-SLAT models not found, using coarse path")
 			slatPath, shapePath = "", ""
+		} else if !*no1024 {
+			slatHRPath = pick(*slatHR, "slat_flow_1024_f16.gguf")
+			if !fileExists(slatHRPath) {
+				log.Printf("1024 model not found, 512 fine max")
+				slatHRPath = ""
+			}
 		}
 	}
 
 	eng, err := newEngine(*libPath, pick(*dino, "dino_f16.gguf"),
 		pick(*flow, "ss_flow_f16.gguf"), pick(*dec, "ss_dec_f16.gguf"),
-		slatPath, shapePath)
+		slatPath, slatHRPath, shapePath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	mode := "coarse (marching cubes)"
-	if eng.fine {
-		mode = "fine (dual-grid)"
+	if eng.caps&cap1024 != 0 {
+		mode = "1024 cascade (+ 512 fine, coarse)"
+	} else if eng.caps&cap512 != 0 {
+		mode = "512 fine (+ coarse)"
 	}
-	log.Printf("models loaded, backend: %s, mesh: %s", eng.backend, mode)
+	log.Printf("models loaded, backend: %s, qualities: %s", eng.backend, mode)
 
 	s := &server{eng: eng, jobs: map[string]*job{}, q: make(chan *job, 8)}
 	go s.worker()
