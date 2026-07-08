@@ -7,6 +7,8 @@
 #include "gguf.h"
 
 #include <vector>
+#include <algorithm>
+#include <array>
 
 #include <chrono>
 #include <cmath>
@@ -1809,6 +1811,14 @@ trellis2_slat_flow_load(const std::string & path, bool load_tensors, std::string
         hp.norm_mean[c] = kv_f32(m->gguf, K("norm_mean." + std::to_string(c)).c_str(), 0.0f);
         hp.norm_std[c]  = kv_f32(m->gguf, K("norm_std."  + std::to_string(c)).c_str(), 1.0f);
     }
+    // Texture SLAT flow: concat_cond. 0/absent on the shape flow. When > 0, the
+    // shape SLAT (concat_norm-normalized) is concatenated onto the noise so the
+    // DiT sees in_channels = out_channels + concat_cond_channels.
+    hp.concat_cond_channels = (int32_t) kv_u32(m->gguf, K("concat_cond_channels").c_str(), 0);
+    for (int c = 0; c < hp.concat_cond_channels && c < 64; ++c) {
+        hp.concat_norm_mean[c] = kv_f32(m->gguf, K("concat_norm_mean." + std::to_string(c)).c_str(), 0.0f);
+        hp.concat_norm_std[c]  = kv_f32(m->gguf, K("concat_norm_std."  + std::to_string(c)).c_str(), 1.0f);
+    }
 
     for (ggml_tensor * t = ggml_get_first_tensor(m->ctx); t != nullptr;
          t = ggml_get_next_tensor(m->ctx, t)) {
@@ -2167,6 +2177,118 @@ bool trellis2_slat_flow_sample(trellis2_slat_flow_model * m,
     return true;
 }
 
+// Texture-SLAT flow sampling with concat_cond. Same flow-Euler loop, but the
+// diffused variable is out_channels (32) and each forward is fed a fresh
+// [noise(32) | normalized shape-SLAT(32)] = in_channels (64) input.
+bool trellis2_slat_flow_sample_tex(trellis2_slat_flow_model * m,
+                                   int n_voxels, const int32_t * coords,
+                                   const float * cond, int cond_tokens, int cond_channels,
+                                   const float * shape_slat,
+                                   const trellis2_ss_sampler_params * params_in,
+                                   const float * noise, bool denormalize,
+                                   float * out_latent, std::string * error) {
+    if (!m)           { set_error(error, "null model"); return false; }
+    if (!m->has_data) { set_error(error, "model loaded metadata-only; reload with load_tensors=true"); return false; }
+
+    const trellis2_slat_flow_hparams & hp = m->hp;
+    const int Cin = hp.in_channels, Cout = hp.out_channels, Ccat = hp.concat_cond_channels;
+    if (Ccat <= 0 || Cin != Cout + Ccat) {
+        set_error(error, "model is not a concat_cond (texture) flow"); return false;
+    }
+
+    trellis2_ss_sampler_params P;
+    if (params_in) P = *params_in;
+    const size_t n = (size_t) Cout * n_voxels;   // diffused variable
+    const double sm = P.sigma_min;
+
+    std::vector<float> x_t(n);
+    if (noise) {
+        std::memcpy(x_t.data(), noise, n * sizeof(float));
+    } else {
+        std::mt19937_64 rng(P.seed);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (size_t i = 0; i < n; ++i) x_t[i] = nd(rng);
+    }
+
+    // shape SLAT normalized by concat_norm (once); concatenated onto the noise.
+    std::vector<float> shape_n((size_t) Ccat * n_voxels);
+    for (int v = 0; v < n_voxels; ++v)
+        for (int c = 0; c < Ccat; ++c)
+            shape_n[(size_t) v * Ccat + c] =
+                (shape_slat[(size_t) v * Ccat + c] - hp.concat_norm_mean[c]) / hp.concat_norm_std[c];
+
+    std::vector<double> ts((size_t) P.steps + 1);
+    for (int i = 0; i <= P.steps; ++i) {
+        const double lin = 1.0 - (double) i / (double) P.steps;
+        ts[i] = P.rescale_t * lin / (1.0 + (P.rescale_t - 1.0) * lin);
+    }
+
+    const std::vector<float> zero_cond((size_t) cond_tokens * cond_channels, 0.0f);
+    std::vector<float> pred_pos(n), pred_neg(n), pred_v(n), x0_pos(n), x0_cfg(n);
+    std::vector<float> xin((size_t) Cin * n_voxels);
+
+    auto fwd = [&](double t, const float * c, std::vector<float> & dst) -> bool {
+        for (int v = 0; v < n_voxels; ++v) {
+            float * d = xin.data() + (size_t) v * Cin;
+            std::memcpy(d, x_t.data() + (size_t) v * Cout, (size_t) Cout * sizeof(float));
+            std::memcpy(d + Cout, shape_n.data() + (size_t) v * Ccat, (size_t) Ccat * sizeof(float));
+        }
+        return trellis2_slat_flow_forward(m, xin.data(), n_voxels, coords,
+                                          (float) (1000.0 * t),
+                                          c, cond_tokens, cond_channels, dst.data(), error);
+    };
+
+    for (int i = 0; i < P.steps; ++i) {
+        const double t = ts[i], t_prev = ts[i + 1];
+        const bool in_interval = (t >= P.guidance_interval_min && t <= P.guidance_interval_max);
+        const float gs = in_interval ? P.guidance_strength : 1.0f;
+
+        if (gs == 1.0f) {
+            if (!fwd(t, cond, pred_v)) return false;
+        } else if (gs == 0.0f) {
+            if (!fwd(t, zero_cond.data(), pred_v)) return false;
+        } else {
+            if (!fwd(t, cond, pred_pos)) return false;
+            if (!fwd(t, zero_cond.data(), pred_neg)) return false;
+            for (size_t k = 0; k < n; ++k) pred_v[k] = gs * pred_pos[k] + (1.0f - gs) * pred_neg[k];
+
+            if (P.guidance_rescale > 0.0f) {
+                pred_to_xstart(x_t, t, sm, pred_pos, x0_pos);
+                pred_to_xstart(x_t, t, sm, pred_v,   x0_cfg);
+                const double std_pos = unbiased_std(x0_pos);
+                const double std_cfg = unbiased_std(x0_cfg);
+                const double ratio = (std_cfg != 0.0) ? std_pos / std_cfg : 1.0;
+                const float  gr = P.guidance_rescale;
+                for (size_t k = 0; k < n; ++k) {
+                    const double rescaled = x0_cfg[k] * ratio;
+                    x0_cfg[k] = (float) (gr * rescaled + (1.0 - gr) * x0_cfg[k]);
+                }
+                xstart_to_pred(x_t, t, sm, x0_cfg, pred_v);
+            }
+        }
+
+        const double dt = t - t_prev;
+        for (size_t k = 0; k < n; ++k) x_t[k] = (float) (x_t[k] - dt * pred_v[k]);
+
+        if (P.verbose) {
+            std::fprintf(stderr, "\r[tex slat sample] step %2d/%d  t=%.4f->%.4f  %s   ",
+                         i + 1, P.steps, t, t_prev, in_interval ? "cfg" : "uncond");
+            std::fflush(stderr);
+        }
+        if (P.progress) P.progress(P.progress_user, i + 1, P.steps);
+    }
+    if (P.verbose) std::fprintf(stderr, "\n");
+
+    if (denormalize) {
+        for (int v = 0; v < n_voxels; ++v)
+            for (int c = 0; c < Cout; ++c)
+                x_t[(size_t) v * Cout + c] = x_t[(size_t) v * Cout + c] * hp.norm_std[c] + hp.norm_mean[c];
+    }
+
+    std::memcpy(out_latent, x_t.data(), n * sizeof(float));
+    return true;
+}
+
 /*****************************************************************************
 ** Shape-SLAT VAE decoder (FlexiDualGridVaeDecoder) — GGUF loader
 *****************************************************************************/
@@ -2184,9 +2306,9 @@ struct trellis2_shape_dec_model {
     std::unordered_map<std::string, ggml_tensor *> tensors;
 };
 
-trellis2_shape_dec_model *
-trellis2_shape_dec_load(const std::string & path, bool load_tensors, std::string * error,
-                        const char * device) {
+static trellis2_shape_dec_model *
+dec_load_impl(const std::string & path, bool load_tensors, std::string * error,
+              const char * device, const char * expect_arch, const char * kv_prefix) {
     auto * m = new trellis2_shape_dec_model();
 
     gguf_init_params params;
@@ -2201,15 +2323,15 @@ trellis2_shape_dec_load(const std::string & path, bool load_tensors, std::string
     }
 
     const char * arch = kv_str(m->gguf, "general.architecture", "");
-    if (std::strcmp(arch, "trellis2-shape-dec") != 0) {
+    if (std::strcmp(arch, expect_arch) != 0) {
         set_error(error, std::string("unexpected architecture '") + arch +
-                         "' (expected 'trellis2-shape-dec')");
+                         "' (expected '" + expect_arch + "')");
         trellis2_shape_dec_free(m);
         return nullptr;
     }
 
     trellis2_shape_dec_hparams & hp = m->hp;
-    const char * P = "trellis2.shape_dec.";
+    const char * P = kv_prefix;
     auto K = [&](const std::string & suffix) { return std::string(P) + suffix; };
 
     hp.latent_channels = (int32_t) kv_u32(m->gguf, K("latent_channels").c_str(), 0);
@@ -2263,6 +2385,22 @@ trellis2_shape_dec_load(const std::string & path, bool load_tensors, std::string
     }
 
     return m;
+}
+
+trellis2_shape_dec_model *
+trellis2_shape_dec_load(const std::string & path, bool load_tensors, std::string * error,
+                        const char * device) {
+    return dec_load_impl(path, load_tensors, error, device,
+                         "trellis2-shape-dec", "trellis2.shape_dec.");
+}
+
+// The texture decoder is the same struct/driver as the shape decoder (out=6,
+// pred_subdiv=False supplied at decode time via trellis2_tex_dec_decode).
+trellis2_shape_dec_model *
+trellis2_tex_dec_load(const std::string & path, bool load_tensors, std::string * error,
+                      const char * device) {
+    return dec_load_impl(path, load_tensors, error, device,
+                         "trellis2-tex-dec", "trellis2.tex_dec.");
 }
 
 void trellis2_shape_dec_free(trellis2_shape_dec_model * m) {
@@ -2340,12 +2478,19 @@ void build_neighbor_indices(const std::vector<int32_t> & coords, int L,
 static bool shape_dec_run(trellis2_shape_dec_model * m,
                           const float * slat, int n_voxels, const int32_t * coords_in,
                           int upsample_times,
+                          const std::vector<trellis2_subdiv_level> * guide,
+                          bool pbr_scale,
                           std::vector<float> & out_feats,
                           std::vector<int32_t> & out_coords,
                           trellis2_shape_dec_taps * taps,
                           std::string * error) {
     if (!m)           { set_error(error, "null model"); return false; }
     if (!m->has_data) { set_error(error, "model loaded metadata-only; reload with load_tensors=true"); return false; }
+    // Texture decoder (pred_subdiv=False): the per-level subdivision is supplied
+    // by the shape encoder (`guide`) instead of predicted by a to_subdiv head.
+    if (guide && (int) guide->size() < m->hp.n_levels - 1) {
+        set_error(error, "guide subdivisions shorter than n_levels-1"); return false;
+    }
 
     const trellis2_shape_dec_hparams & hp = m->hp;
     const int n_levels = hp.n_levels;
@@ -2525,11 +2670,13 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         if (has_up) {
             const std::string up = "blocks." + std::to_string(lvl) + "." +
                                    std::to_string(hp.num_blocks[lvl]);
-            ggml_tensor * subdiv = lin(h, up + ".to_subdiv");                 // [8, L]
+            if (!guide) {   // shape decoder: predict which children exist
+                ggml_tensor * subdiv = lin(h, up + ".to_subdiv");            // [8, L]
+                outs.emplace_back("subdiv", ggml_cont(ctx, subdiv));
+            }
             ggml_tensor * hn = ln_affine(h, up + ".norm1");
             hn = ggml_silu(ctx, hn);
             ggml_tensor * h1 = conv(hn, up + ".conv1");                       // [C_next*8, L]
-            outs.emplace_back("subdiv", ggml_cont(ctx, subdiv));
             outs.emplace_back("h1", ggml_cont(ctx, h1));
             outs.emplace_back("x", ggml_cont(ctx, h));
         } else {
@@ -2604,34 +2751,44 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         }
 
         if (has_up) {
-            // Read only the subdivision logits (small) up front.
-            up_subdiv.resize((size_t) 8 * L);
-            ggml_tensor * h1_o = nullptr, * x_o = nullptr;
+            ggml_tensor * h1_o = nullptr, * x_o = nullptr, * subdiv_o = nullptr;
             for (auto & o : outs) {
-                if (o.first == "subdiv") ggml_backend_tensor_get(o.second, up_subdiv.data(), 0, up_subdiv.size() * es);
+                if (o.first == "subdiv") subdiv_o = o.second;
                 if (o.first == "h1")     h1_o = o.second;
                 if (o.first == "x")      x_o  = o.second;
             }
-            if (taps) cap("lvl" + std::to_string(lvl) + ".subdiv", up_subdiv.data(), up_subdiv.size());
+            if (!guide) {   // shape decoder: read the predicted subdivision logits
+                up_subdiv.resize((size_t) 8 * L);
+                ggml_backend_tensor_get(subdiv_o, up_subdiv.data(), 0, up_subdiv.size() * es);
+                if (taps) cap("lvl" + std::to_string(lvl) + ".subdiv", up_subdiv.data(), up_subdiv.size());
+            }
 
-            // Expand to child coords and, in the same pass, the gather index
-            // (surviving child slot o + 8*v, in [0, 8L)).
+            // The surviving children + their gather index (child slot o + 8*parent,
+            // in [0, 8L)). Shape decoder: expand from predicted subdivision logits.
+            // Texture decoder: replay the encoder's recorded subdivision (`guide`),
+            // which also reproduces the encoder's exact input voxel order.
             std::vector<int32_t> child_coords, cidx;
-            child_coords.reserve((size_t) L * 3);
-            cidx.reserve((size_t) L);
-            for (int v = 0; v < L; ++v) {
-                for (int o = 0; o < 8; ++o) {
-                    if (up_subdiv[(size_t) v * 8 + o] > 0.0f) {
-                        cidx.push_back(o + 8 * v);
-                        child_coords.push_back(2 * coords[(size_t) v * 3]     + (o & 1));
-                        child_coords.push_back(2 * coords[(size_t) v * 3 + 1] + ((o >> 1) & 1));
-                        child_coords.push_back(2 * coords[(size_t) v * 3 + 2] + ((o >> 2) & 1));
+            if (guide) {
+                const trellis2_subdiv_level & g = (*guide)[lvl];
+                child_coords = g.fine_coords;
+                cidx = g.cidx;
+            } else {
+                child_coords.reserve((size_t) L * 3);
+                cidx.reserve((size_t) L);
+                for (int v = 0; v < L; ++v) {
+                    for (int o = 0; o < 8; ++o) {
+                        if (up_subdiv[(size_t) v * 8 + o] > 0.0f) {
+                            cidx.push_back(o + 8 * v);
+                            child_coords.push_back(2 * coords[(size_t) v * 3]     + (o & 1));
+                            child_coords.push_back(2 * coords[(size_t) v * 3 + 1] + ((o >> 1) & 1));
+                            child_coords.push_back(2 * coords[(size_t) v * 3 + 2] + ((o >> 2) & 1));
+                        }
                     }
                 }
             }
             const int L_child = (int) cidx.size();
             if (L_child == 0) {
-                set_error(error, "subdivision predicted no children at level " + std::to_string(lvl));
+                set_error(error, "no children at level " + std::to_string(lvl));
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
             }
@@ -2672,9 +2829,11 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
                     ggml_backend_tensor_get(o.second, out_feats.data(), 0, out_feats.size() * es);
                 }
             }
+            if (pbr_scale)   // tex decoder: map to [0,1] like the reference *0.5+0.5
+                for (float & f : out_feats) f = f * 0.5f + 0.5f;
             out_coords = coords;
             if (taps) {
-                cap("out7", out_feats.data(), out_feats.size());
+                cap(pbr_scale ? "pbr" : "out7", out_feats.data(), out_feats.size());
                 cap_coords("out_coords");
             }
         }
@@ -2707,6 +2866,7 @@ bool trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
                                trellis2_shape_dec_taps * taps,
                                std::string * error) {
     return shape_dec_run(m, slat, n_voxels, coords_in, /*upsample_times*/ -1,
+                         /*guide*/ nullptr, /*pbr_scale*/ false,
                          out_feats, out_coords, taps, error);
 }
 
@@ -2717,5 +2877,408 @@ bool trellis2_shape_dec_upsample(trellis2_shape_dec_model * m,
                                  std::string * error) {
     std::vector<float> unused;
     return shape_dec_run(m, slat, n_voxels, coords, upsample_times,
+                         /*guide*/ nullptr, /*pbr_scale*/ false,
                          unused, out_coords, /*taps*/ nullptr, error);
+}
+
+// Texture decoder: the shape-decoder driver with the encoder's subdivision
+// replayed (guide) and the PBR [0,1] output scale.
+bool trellis2_tex_dec_decode(trellis2_shape_dec_model * m,
+                             const float * slat, int n_voxels, const int32_t * coords,
+                             const std::vector<trellis2_subdiv_level> & subs,
+                             std::vector<float> & out_feats,
+                             std::vector<int32_t> & out_coords,
+                             std::string * error) {
+    return shape_dec_run(m, slat, n_voxels, coords, /*upsample_times*/ -1,
+                         &subs, /*pbr_scale*/ true,
+                         out_feats, out_coords, /*taps*/ nullptr, error);
+}
+
+/*****************************************************************************
+** Shape-SLAT VAE encoder (FlexiDualGridVaeEncoder) — the mirror of the shape
+** decoder. The 6-channel dual grid at resolution R is downsampled 16x through
+** SparseSpatial2Channel (S2C) blocks into the 32-channel shape SLAT at R/16.
+** Unlike the decoder, an S2C step needs no learned decision — the parent set is
+** determined by the coordinates alone — so a whole level (ConvNeXt blocks + the
+** down-block's fine conv1, the S2C gather, and the coarse conv2) runs as one
+** graph. The per-level subdivision (which fine child maps to which coarse
+** parent) is recorded for the texture decoder to replay.
+*****************************************************************************/
+
+struct trellis2_shape_enc_model {
+    gguf_context * gguf = nullptr;
+    ggml_context * ctx  = nullptr;
+    trellis2_shape_enc_hparams hp;
+    bool has_data = false;
+
+    ggml_backend_t        backend     = nullptr;
+    ggml_backend_buffer_t weights_buf = nullptr;
+    std::string           backend_name;
+
+    std::unordered_map<std::string, ggml_tensor *> tensors;
+};
+
+trellis2_shape_enc_model *
+trellis2_shape_enc_load(const std::string & path, bool load_tensors, std::string * error,
+                        const char * device) {
+    auto * m = new trellis2_shape_enc_model();
+
+    gguf_init_params params;
+    params.no_alloc = true;
+    params.ctx      = &m->ctx;
+    m->gguf = gguf_init_from_file(path.c_str(), params);
+    if (!m->gguf) {
+        set_error(error, "gguf_init_from_file failed (not a GGUF file?): " + path);
+        delete m; return nullptr;
+    }
+
+    const char * arch = kv_str(m->gguf, "general.architecture", "");
+    if (std::strcmp(arch, "trellis2-shape-enc") != 0) {
+        set_error(error, std::string("unexpected architecture '") + arch +
+                         "' (expected 'trellis2-shape-enc')");
+        trellis2_shape_enc_free(m); return nullptr;
+    }
+
+    trellis2_shape_enc_hparams & hp = m->hp;
+    const char * P = "trellis2.shape_enc.";
+    auto K = [&](const std::string & s) { return std::string(P) + s; };
+    hp.in_channels     = (int32_t) kv_u32(m->gguf, K("in_channels").c_str(),     6);
+    hp.latent_channels = (int32_t) kv_u32(m->gguf, K("latent_channels").c_str(), 0);
+    hp.n_levels        = (int32_t) kv_u32(m->gguf, K("n_levels").c_str(),        0);
+    hp.norm_eps        =           kv_f32(m->gguf, K("norm_eps").c_str(),        1e-6f);
+    hp.file_type       = (int32_t) kv_u32(m->gguf, "general.file_type", 0);
+    for (int i = 0; i < hp.n_levels && i < 8; ++i) {
+        hp.channels[i]   = (int32_t) kv_u32(m->gguf, K("channels."   + std::to_string(i)).c_str(), 0);
+        hp.num_blocks[i] = (int32_t) kv_u32(m->gguf, K("num_blocks." + std::to_string(i)).c_str(), 0);
+    }
+
+    for (ggml_tensor * t = ggml_get_first_tensor(m->ctx); t != nullptr;
+         t = ggml_get_next_tensor(m->ctx, t)) {
+        m->tensors[t->name] = t;
+    }
+
+    if (load_tensors) {
+        m->backend = init_best_backend(m->backend_name, device);
+        m->weights_buf = ggml_backend_alloc_ctx_tensors(m->ctx, m->backend);
+        if (!m->weights_buf) {
+            set_error(error, "failed to allocate weights on backend " + m->backend_name);
+            trellis2_shape_enc_free(m); return nullptr;
+        }
+        std::ifstream fin(path, std::ios::binary);
+        if (!fin) { set_error(error, "cannot reopen file for weight data: " + path); trellis2_shape_enc_free(m); return nullptr; }
+        const size_t data_off = gguf_get_data_offset(m->gguf);
+        const int64_t nt = gguf_get_n_tensors(m->gguf);
+        std::vector<uint8_t> buf;
+        for (int64_t i = 0; i < nt; ++i) {
+            const char * name = gguf_get_tensor_name(m->gguf, i);
+            ggml_tensor * t = m->tensors[name];
+            const size_t nb = ggml_nbytes(t);
+            const size_t off = data_off + gguf_get_tensor_offset(m->gguf, i);
+            buf.resize(nb);
+            fin.seekg((std::streamoff) off, std::ios::beg);
+            if (!fin.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) nb)) {
+                set_error(error, std::string("failed reading weight '") + name + "' from file");
+                trellis2_shape_enc_free(m); return nullptr;
+            }
+            ggml_backend_tensor_set(t, buf.data(), 0, nb);
+        }
+        m->has_data = true;
+    }
+    return m;
+}
+
+void trellis2_shape_enc_free(trellis2_shape_enc_model * m) {
+    if (!m) return;
+    if (m->weights_buf) ggml_backend_buffer_free(m->weights_buf);
+    if (m->backend)     ggml_backend_free(m->backend);
+    if (m->gguf)        gguf_free(m->gguf);
+    if (m->ctx)         ggml_free(m->ctx);
+    delete m;
+}
+
+const char * trellis2_shape_enc_backend_name(const trellis2_shape_enc_model * m) {
+    return (m && !m->backend_name.empty()) ? m->backend_name.c_str() : "none";
+}
+
+const trellis2_shape_enc_hparams &
+trellis2_shape_enc_hparams_of(const trellis2_shape_enc_model * m) { return m->hp; }
+
+bool trellis2_shape_enc_encode(trellis2_shape_enc_model * m,
+                               const float * in6, int n_voxels, const int32_t * coords_in,
+                               std::vector<float> & out_slat,
+                               std::vector<int32_t> & out_coords,
+                               std::vector<trellis2_subdiv_level> & out_subs,
+                               trellis2_shape_dec_taps * taps,
+                               std::string * error) {
+    if (!m)           { set_error(error, "null model"); return false; }
+    if (!m->has_data) { set_error(error, "model loaded metadata-only; reload with load_tensors=true"); return false; }
+
+    const trellis2_shape_enc_hparams & hp = m->hp;
+    const int n_levels = hp.n_levels;
+    const float eps = hp.norm_eps;
+    const size_t es = sizeof(float);
+    std::string missing;
+
+    // host-side level state
+    std::vector<int32_t> coords(coords_in, coords_in + (size_t) n_voxels * 3);
+    int L = n_voxels;
+    std::vector<float> feats;   // [L * C] voxel-major, current level features
+
+    // input to the network: (dual-vertex offset, intersected) - 0.5
+    std::vector<float> in_shift((size_t) L * hp.in_channels);
+    for (size_t i = 0; i < in_shift.size(); ++i) in_shift[i] = in6[i] - 0.5f;
+
+    out_subs.assign(std::max(0, n_levels - 1), {});
+
+    auto cap = [&](const std::string & name, const float * d, size_t n) {
+        if (!taps) return;
+        taps->names.push_back(name); taps->data.emplace_back(d, d + n);
+    };
+
+    for (int lvl = 0; lvl < n_levels; ++lvl) {
+        const int C_in = hp.channels[lvl];
+        const bool has_down = lvl < n_levels - 1;
+        const int C_out = has_down ? hp.channels[lvl + 1] : 0;
+
+        // ── host: fine neighbor maps (ConvNeXt + down conv1) ────────────────
+        std::vector<std::vector<int32_t>> nfine;
+        build_neighbor_indices(coords, L, nfine);
+
+        // ── host: S2C child map + coarse coords + coarse neighbor maps ──────
+        // coarse parent = fine // 2, subidx = bit-packed (x&1,y&1,z&1). Coarse
+        // coords are lexicographically sorted to match the reference's unique().
+        std::vector<int32_t> coarse_coords;   // [Lc*3]
+        std::vector<int32_t> childidx;        // [Lc*8]  fine row of child (or -1)
+        std::vector<int32_t> cidx;            // [L]     8*parent_row + subidx (decoder replay)
+        int Lc = 0;
+        std::vector<std::vector<int32_t>> ncoarse;
+        if (has_down) {
+            std::unordered_map<uint64_t, int32_t> fine_map;
+            fine_map.reserve((size_t) L * 2);
+            for (int v = 0; v < L; ++v)
+                fine_map[voxel_key(coords[(size_t) v*3], coords[(size_t) v*3+1], coords[(size_t) v*3+2])] = v;
+            // unique parents
+            std::unordered_map<uint64_t, int32_t> parent_seen;
+            parent_seen.reserve((size_t) L);
+            std::vector<std::array<int32_t,3>> parents;
+            for (int v = 0; v < L; ++v) {
+                const int32_t px = coords[(size_t) v*3] >> 1,   // // 2 (coords >= 0)
+                              py = coords[(size_t) v*3+1] >> 1,
+                              pz = coords[(size_t) v*3+2] >> 1;
+                const uint64_t pk = voxel_key(px, py, pz);
+                if (parent_seen.emplace(pk, 0).second) parents.push_back({px, py, pz});
+            }
+            std::sort(parents.begin(), parents.end());   // lexicographic (x,y,z)
+            Lc = (int) parents.size();
+            coarse_coords.resize((size_t) Lc * 3);
+            std::unordered_map<uint64_t, int32_t> coarse_map;
+            coarse_map.reserve((size_t) Lc * 2);
+            for (int p = 0; p < Lc; ++p) {
+                coarse_coords[(size_t) p*3] = parents[p][0];
+                coarse_coords[(size_t) p*3+1] = parents[p][1];
+                coarse_coords[(size_t) p*3+2] = parents[p][2];
+                coarse_map[voxel_key(parents[p][0], parents[p][1], parents[p][2])] = p;
+            }
+            // childidx[pr*8+o] = fine row of child (or -1 sentinel for missing)
+            childidx.assign((size_t) Lc * 8, -1);
+            for (int p = 0; p < Lc; ++p) {
+                for (int o = 0; o < 8; ++o) {
+                    const int32_t cx = 2*parents[p][0] + (o & 1),
+                                  cy = 2*parents[p][1] + ((o >> 1) & 1),
+                                  cz = 2*parents[p][2] + ((o >> 2) & 1);
+                    auto it = fine_map.find(voxel_key(cx, cy, cz));
+                    if (it != fine_map.end()) childidx[(size_t) p*8 + o] = it->second;
+                }
+            }
+            // decoder replay: for each fine voxel, its coarse parent row + subidx
+            cidx.resize((size_t) L);
+            for (int v = 0; v < L; ++v) {
+                const int32_t px = coords[(size_t) v*3] >> 1,
+                              py = coords[(size_t) v*3+1] >> 1,
+                              pz = coords[(size_t) v*3+2] >> 1;
+                const int o = (coords[(size_t) v*3] & 1)
+                            | ((coords[(size_t) v*3+1] & 1) << 1)
+                            | ((coords[(size_t) v*3+2] & 1) << 2);
+                cidx[(size_t) v] = 8 * coarse_map[voxel_key(px, py, pz)] + o;
+            }
+            build_neighbor_indices(coarse_coords, Lc, ncoarse);
+        }
+
+        // ── graph ───────────────────────────────────────────────────────────
+        const size_t gsize = 65536;
+        const size_t mem = ggml_tensor_overhead() * gsize + ggml_graph_overhead_custom(gsize, false);
+        ggml_init_params ip{ mem, nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, gsize, false);
+
+        auto W = [&](const std::string & n) -> ggml_tensor * {
+            auto it = m->tensors.find(n);
+            if (it == m->tensors.end()) { if (missing.empty()) missing = n; return nullptr; }
+            return it->second;
+        };
+        auto lin = [&](ggml_tensor * in, const std::string & pfx) -> ggml_tensor * {
+            ggml_tensor * y = ggml_mul_mat(ctx, W(pfx + ".weight"), in);
+            ggml_tensor * b = W(pfx + ".bias");
+            if (b) y = ggml_add(ctx, y, b);
+            return y;
+        };
+        auto ln_affine = [&](ggml_tensor * h, const std::string & pfx) -> ggml_tensor * {
+            ggml_tensor * y = ggml_norm(ctx, h, eps);
+            y = ggml_mul(ctx, y, W(pfx + ".weight"));
+            y = ggml_add(ctx, y, W(pfx + ".bias"));
+            return y;
+        };
+
+        // 27 fine + 27 coarse neighbor leaves
+        std::vector<ggml_tensor *> idx_f(27), mask_f(27), idx_c(27), mask_c(27);
+        for (int k = 0; k < 27; ++k) {
+            idx_f[k]  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, L);
+            mask_f[k] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L);
+            ggml_set_input(idx_f[k]); ggml_set_input(mask_f[k]);
+        }
+        if (has_down) {
+            for (int k = 0; k < 27; ++k) {
+                idx_c[k]  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, Lc);
+                mask_c[k] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, Lc);
+                ggml_set_input(idx_c[k]); ggml_set_input(mask_c[k]);
+            }
+        }
+        auto conv = [&](ggml_tensor * x, const std::string & pfx,
+                        std::vector<ggml_tensor *> & idxs, std::vector<ggml_tensor *> & masks) -> ggml_tensor * {
+            ggml_tensor * w = W(pfx + ".weight");   // ne [Ci, 27, Co]
+            ggml_tensor * b = W(pfx + ".bias");
+            if (!w || !b) return x;
+            const int64_t Ci = w->ne[0], Co = w->ne[2];
+            ggml_tensor * acc = nullptr;
+            for (int k = 0; k < 27; ++k) {
+                ggml_tensor * wk = ggml_cont(ctx, ggml_view_3d(ctx, w, Ci, 1, Co, w->nb[1], w->nb[2], (size_t) k*w->nb[1]));
+                wk = ggml_reshape_2d(ctx, wk, Ci, Co);
+                ggml_tensor * g = ggml_get_rows(ctx, x, idxs[k]);
+                g = ggml_mul(ctx, g, masks[k]);
+                ggml_tensor * y = ggml_mul_mat(ctx, wk, g);
+                acc = acc ? ggml_add(ctx, acc, y) : y;
+            }
+            return ggml_add(ctx, acc, b);
+        };
+        auto convnext = [&](ggml_tensor * x, const std::string & pfx) -> ggml_tensor * {
+            ggml_tensor * h = conv(x, pfx + ".conv", idx_f, mask_f);
+            h = ln_affine(h, pfx + ".norm");
+            h = lin(h, pfx + ".mlp.0");
+            h = ggml_silu(ctx, h);
+            h = lin(h, pfx + ".mlp.2");
+            return ggml_add(ctx, h, x);
+        };
+
+        // input for this level: 6-channel dual grid at lvl 0 (through input_layer),
+        // else the previous level's [C_in, L] features.
+        const int in_dim = (lvl == 0) ? hp.in_channels : C_in;
+        ggml_tensor * in_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, in_dim, L);
+        ggml_set_input(in_a);
+        ggml_tensor * h = (lvl == 0) ? lin(in_a, "input_layer") : in_a;
+
+        for (int b = 0; b < hp.num_blocks[lvl]; ++b)
+            h = convnext(h, "blocks." + std::to_string(lvl) + "." + std::to_string(b));
+
+        // S2C child-gather leaves (shared by the h1 and skip-x gathers)
+        ggml_tensor * cidx_t = nullptr, * cmask_t = nullptr;
+        ggml_tensor * out_h = nullptr;
+        if (has_down) {
+            const std::string down = "blocks." + std::to_string(lvl) + "." + std::to_string(hp.num_blocks[lvl]);
+            cidx_t  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) Lc * 8);
+            cmask_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, (int64_t) Lc * 8);
+            ggml_set_input(cidx_t); ggml_set_input(cmask_t);
+
+            ggml_tensor * hn1 = ggml_silu(ctx, ln_affine(h, down + ".norm1"));
+            ggml_tensor * h1 = conv(hn1, down + ".conv1", idx_f, mask_f);       // [C_out/8, L]
+            // S2C gather: [ch, L] -> [ch, Lc*8] (masked) -> reshape [ch*8, Lc]
+            auto s2c = [&](ggml_tensor * t, int ch) -> ggml_tensor * {
+                ggml_tensor * g = ggml_get_rows(ctx, t, cidx_t);               // [ch, Lc*8]
+                g = ggml_mul(ctx, g, cmask_t);
+                return ggml_reshape_2d(ctx, ggml_cont(ctx, g), (int64_t) ch * 8, Lc);
+            };
+            ggml_tensor * h1c = s2c(h1, C_out / 8);                            // [C_out, Lc]
+            ggml_tensor * xc  = s2c(h, C_in);                                  // [C_in*8, Lc]
+            ggml_tensor * hn2 = ggml_silu(ctx, ggml_norm(ctx, h1c, eps));      // norm2 affine-free
+            ggml_tensor * h2  = conv(hn2, down + ".conv2", idx_c, mask_c);     // [C_out, Lc]
+            // skip: mean over the (C_in*8 / C_out) group of xc
+            const int gsz = (C_in * 8) / C_out;
+            ggml_tensor * skip = ggml_reshape_3d(ctx, xc, gsz, C_out, Lc);
+            skip = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_mean(ctx, skip)), C_out, Lc);
+            out_h = ggml_add(ctx, h2, skip);                                   // [C_out, Lc]
+        } else {
+            ggml_tensor * hn = ggml_norm(ctx, h, 1e-5f);                       // F.layer_norm affine-free
+            ggml_tensor * z = lin(hn, "to_latent");                           // [2*latent, L]
+            // take the mean half (posterior mean): channels [0, latent)
+            out_h = ggml_cont(ctx, ggml_view_2d(ctx, z, hp.latent_channels, L, z->nb[1], 0));
+        }
+        out_h = ggml_cont(ctx, out_h);
+        ggml_set_output(out_h);
+        ggml_build_forward_expand(gf, out_h);
+
+        if (!missing.empty()) {
+            set_error(error, "missing tensor: " + missing + " (level " + std::to_string(lvl) + ")");
+            ggml_free(ctx); return false;
+        }
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+            set_error(error, "ggml_gallocr_alloc_graph failed (enc level " + std::to_string(lvl) + ")");
+            ggml_gallocr_free(alloc); ggml_free(ctx); return false;
+        }
+
+        // upload neighbor leaves (clamp missing to row 0, mask 0)
+        auto upload_nbr = [&](std::vector<std::vector<int32_t>> & nb, int Ln,
+                              std::vector<ggml_tensor *> & idxs, std::vector<ggml_tensor *> & masks) {
+            std::vector<int32_t> cl((size_t) Ln); std::vector<float> mk((size_t) Ln);
+            for (int k = 0; k < 27; ++k) {
+                for (int v = 0; v < Ln; ++v) {
+                    const bool miss = nb[k][(size_t) v] >= Ln;
+                    cl[(size_t) v] = miss ? 0 : nb[k][(size_t) v];
+                    mk[(size_t) v] = miss ? 0.0f : 1.0f;
+                }
+                ggml_backend_tensor_set(idxs[k], cl.data(), 0, (size_t) Ln * sizeof(int32_t));
+                ggml_backend_tensor_set(masks[k], mk.data(), 0, (size_t) Ln * sizeof(float));
+            }
+        };
+        upload_nbr(nfine, L, idx_f, mask_f);
+        if (lvl == 0) ggml_backend_tensor_set(in_a, in_shift.data(), 0, in_shift.size() * es);
+        else          ggml_backend_tensor_set(in_a, feats.data(),   0, feats.size() * es);
+        if (has_down) {
+            upload_nbr(ncoarse, Lc, idx_c, mask_c);
+            std::vector<int32_t> cl((size_t) Lc * 8); std::vector<float> mk((size_t) Lc * 8);
+            for (size_t i = 0; i < cl.size(); ++i) {
+                const bool miss = childidx[i] < 0;
+                cl[i] = miss ? 0 : childidx[i];
+                mk[i] = miss ? 0.0f : 1.0f;
+            }
+            ggml_backend_tensor_set(cidx_t,  cl.data(), 0, cl.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(cmask_t, mk.data(), 0, mk.size() * sizeof(float));
+        }
+
+        if (ggml_backend_graph_compute(m->backend, gf) != GGML_STATUS_SUCCESS) {
+            set_error(error, "enc graph compute failed (level " + std::to_string(lvl) + ")");
+            ggml_gallocr_free(alloc); ggml_free(ctx); return false;
+        }
+
+        const int C_next = has_down ? C_out : hp.latent_channels;
+        const int L_next = has_down ? Lc : L;
+        feats.resize((size_t) C_next * L_next);
+        ggml_backend_tensor_get(out_h, feats.data(), 0, feats.size() * es);
+
+        if (taps) cap("enc_lvl" + std::to_string(lvl), feats.data(), feats.size());
+
+        if (has_down) {
+            // record subdivision for the decoder (decoder order = reverse of encode)
+            trellis2_subdiv_level & sl = out_subs[(size_t)(n_levels - 2 - lvl)];
+            sl.fine_coords = coords;   // this level's (fine) coords, in fine order
+            sl.cidx = std::move(cidx);
+            coords = std::move(coarse_coords);
+            L = Lc;
+        } else {
+            out_slat = feats;
+            out_coords = coords;
+        }
+        ggml_gallocr_free(alloc); ggml_free(ctx);
+    }
+    return true;
 }

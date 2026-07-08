@@ -12,7 +12,7 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-const abiVersion = 2
+const abiVersion = 3
 
 // Progress stages (enum t2_stage).
 const (
@@ -59,10 +59,11 @@ type engine struct {
 
 	pipeline uintptr
 	backend  string
-	caps     int // bitmask of t2_caps
+	caps     int  // bitmask of t2_caps
+	textured bool // PBR texturing enabled
 
 	abiVersion      func() int32
-	pipelineLoad    func(dino, flow, dec, slat, slatHR, shapeDec string, flags int32, err unsafe.Pointer, errLen int32) uintptr
+	pipelineLoad    func(dino, flow, dec, slat, slatHR, shapeDec, shapeEnc, texDec, texFlow, texFlowHR string, flags int32, err unsafe.Pointer, errLen int32) uintptr
 	pipelineFree    func(p uintptr)
 	pipelineBackend func(p uintptr) string
 	pipelineCaps    func(p uintptr) int32
@@ -74,6 +75,8 @@ type engine struct {
 	meshVerts    func(r uintptr) uintptr
 	meshNormals  func(r uintptr) uintptr
 	meshTris     func(r uintptr) uintptr
+	meshHasPBR   func(r uintptr) int32
+	meshPBR      func(r uintptr) uintptr
 	meshFree     func(r uintptr)
 }
 
@@ -89,7 +92,8 @@ var progressCallback uintptr // created once; purego callbacks are permanent
 
 // slatGGUF/shapeDecGGUF may be "" for the coarse path; slatHRGGUF may be "" to
 // disable the 1024 cascade (512 fine only).
-func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shapeDecGGUF string) (*engine, error) {
+func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shapeDecGGUF,
+	shapeEncGGUF, texDecGGUF, texFlowGGUF, texFlowHRGGUF string) (*engine, error) {
 	lib, err := purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
 	if err != nil {
 		return nil, fmt.Errorf("dlopen %s: %w", libPath, err)
@@ -110,6 +114,8 @@ func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shape
 	purego.RegisterLibFunc(&e.meshVerts, lib, "t2_mesh_verts")
 	purego.RegisterLibFunc(&e.meshNormals, lib, "t2_mesh_normals")
 	purego.RegisterLibFunc(&e.meshTris, lib, "t2_mesh_tris")
+	purego.RegisterLibFunc(&e.meshHasPBR, lib, "t2_mesh_has_pbr")
+	purego.RegisterLibFunc(&e.meshPBR, lib, "t2_mesh_pbr")
 	purego.RegisterLibFunc(&e.meshFree, lib, "t2_mesh_free")
 
 	if progressCallback == 0 {
@@ -126,6 +132,7 @@ func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shape
 
 	errBuf := make([]byte, 512)
 	p := e.pipelineLoad(dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shapeDecGGUF,
+		shapeEncGGUF, texDecGGUF, texFlowGGUF, texFlowHRGGUF,
 		0 /*flags*/, unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
 	if p == 0 {
 		return nil, fmt.Errorf("pipeline load: %s", cstr(errBuf))
@@ -133,6 +140,7 @@ func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shape
 	e.pipeline = p
 	e.backend = e.pipelineBackend(p)
 	e.caps = int(e.pipelineCaps(p))
+	e.textured = shapeEncGGUF != ""
 	return e, nil
 }
 
@@ -142,6 +150,7 @@ type meshData struct {
 	Verts   []float32 // 3 * NVerts
 	Normals []float32 // 3 * NVerts
 	Tris    []int32   // 3 * NTris
+	PBR     []float32 // 5 * NVerts (base_color rgb, metallic, roughness); nil if untextured
 }
 
 // Generate runs the full image->mesh pipeline. onProgress may be nil.
@@ -184,6 +193,9 @@ func (e *engine) Generate(image []byte, pipelineType int, seed uint64, steps int
 	m.Verts = copyFloats(e.meshVerts(r), 3*nv)
 	m.Normals = copyFloats(e.meshNormals(r), 3*nv)
 	m.Tris = copyInts(e.meshTris(r), 3*nt)
+	if e.meshHasPBR(r) != 0 {
+		m.PBR = copyFloats(e.meshPBR(r), 5*nv)
+	}
 	return m, nil
 }
 

@@ -185,12 +185,25 @@ func (s *server) handleMesh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Wire format. T2MESH01: verts, normals, tris. T2MESH02 (textured): also a
+	// per-vertex PBR block (5 floats: base_color rgb, metallic, roughness) after
+	// the normals, before the tris.
+	//   magic[8] u32 nv u32 nt  f32[3nv] verts  f32[3nv] normals
+	//   [T2MESH02: f32[5nv] pbr]  i32[3nt] tris
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Write([]byte("T2MESH01"))
+	textured := len(mesh.PBR) == 5*mesh.NVerts
+	if textured {
+		w.Write([]byte("T2MESH02"))
+	} else {
+		w.Write([]byte("T2MESH01"))
+	}
 	binary.Write(w, binary.LittleEndian, uint32(mesh.NVerts))
 	binary.Write(w, binary.LittleEndian, uint32(mesh.NTris))
 	binary.Write(w, binary.LittleEndian, mesh.Verts)
 	binary.Write(w, binary.LittleEndian, mesh.Normals)
+	if textured {
+		binary.Write(w, binary.LittleEndian, mesh.PBR)
+	}
 	binary.Write(w, binary.LittleEndian, mesh.Tris)
 }
 
@@ -212,6 +225,7 @@ func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"backend":   s.eng.backend,
 		"qualities": qualities,
 		"best":      best,
+		"textured":  s.eng.textured,
 		"defaults": map[string]interface{}{
 			"steps":    12,
 			"guidance": 7.5,
@@ -256,8 +270,13 @@ func main() {
 	slat := flag.String("slat", "", "512 shape-slat flow gguf (default <ggufs>/slat_flow_f16.gguf)")
 	slatHR := flag.String("slat-hr", "", "1024 shape-slat flow gguf (default <ggufs>/slat_flow_1024_f16.gguf)")
 	shapeDec := flag.String("shape-dec", "", "shape decoder gguf (default <ggufs>/shape_dec_f16.gguf)")
+	shapeEnc := flag.String("shape-enc", "", "shape encoder gguf (default <ggufs>/shape_enc_f16.gguf)")
+	texDec := flag.String("tex-dec", "", "texture decoder gguf (default <ggufs>/tex_dec_f16.gguf)")
+	texSlat := flag.String("tex-slat", "", "512 texture-slat flow gguf (default <ggufs>/tex_slat_flow_512_f16.gguf)")
+	texSlatHR := flag.String("tex-slat-hr", "", "1024 texture-slat flow gguf (default <ggufs>/tex_slat_flow_1024_f16.gguf)")
 	coarse := flag.Bool("coarse", false, "coarse marching-cubes path only (skip shape-SLAT models)")
 	no1024 := flag.Bool("no-1024", false, "disable the 1024 cascade (512 fine max)")
+	noTexture := flag.Bool("no-texture", false, "disable PBR texturing (geometry only)")
 	addr := flag.String("addr", ":8742", "listen address")
 	flag.Parse()
 
@@ -270,24 +289,43 @@ func main() {
 	// The fine (dual-grid) path needs the two shape-SLAT models; the 1024 cascade
 	// additionally needs the 1024 model. Missing files degrade gracefully.
 	slatPath, shapePath, slatHRPath := "", "", ""
+	shapeEncPath, texDecPath, texSlatPath, texSlatHRPath := "", "", "", ""
 	if !*coarse {
 		slatPath = pick(*slat, "slat_flow_f16.gguf")
 		shapePath = pick(*shapeDec, "shape_dec_f16.gguf")
 		if !fileExists(slatPath) || !fileExists(shapePath) {
 			log.Printf("shape-SLAT models not found, using coarse path")
 			slatPath, shapePath = "", ""
-		} else if !*no1024 {
-			slatHRPath = pick(*slatHR, "slat_flow_1024_f16.gguf")
-			if !fileExists(slatHRPath) {
-				log.Printf("1024 model not found, 512 fine max")
-				slatHRPath = ""
+		} else {
+			if !*no1024 {
+				slatHRPath = pick(*slatHR, "slat_flow_1024_f16.gguf")
+				if !fileExists(slatHRPath) {
+					log.Printf("1024 model not found, 512 fine max")
+					slatHRPath = ""
+				}
+			}
+			// PBR texturing needs the shape encoder, tex decoder, and 512 tex flow.
+			if !*noTexture {
+				shapeEncPath = pick(*shapeEnc, "shape_enc_f16.gguf")
+				texDecPath = pick(*texDec, "tex_dec_f16.gguf")
+				texSlatPath = pick(*texSlat, "tex_slat_flow_512_f16.gguf")
+				if fileExists(shapeEncPath) && fileExists(texDecPath) && fileExists(texSlatPath) {
+					texSlatHRPath = pick(*texSlatHR, "tex_slat_flow_1024_f16.gguf")
+					if !fileExists(texSlatHRPath) {
+						texSlatHRPath = ""
+					}
+				} else {
+					log.Printf("texture models not found, geometry only")
+					shapeEncPath, texDecPath, texSlatPath = "", "", ""
+				}
 			}
 		}
 	}
 
 	eng, err := newEngine(*libPath, pick(*dino, "dino_f16.gguf"),
 		pick(*flow, "ss_flow_f16.gguf"), pick(*dec, "ss_dec_f16.gguf"),
-		slatPath, slatHRPath, shapePath)
+		slatPath, slatHRPath, shapePath,
+		shapeEncPath, texDecPath, texSlatPath, texSlatHRPath)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -26,7 +26,7 @@
 extern "C" {
 #endif
 
-#define T2_CAPI_ABI_VERSION 2
+#define T2_CAPI_ABI_VERSION 3
 
 TRELLIS2_CAPI int t2_abi_version(void);
 
@@ -41,7 +41,8 @@ enum t2_stage {
     T2_STAGE_MESH         = 6,  /* mesh extraction                        */
     T2_STAGE_UPSAMPLE     = 7,  /* cascade: LR slat -> HR voxel scaffold  */
     T2_STAGE_SLAT_FLOW_HR = 8,  /* cascade: 1024 shape-SLAT flow (steps)  */
-    T2_STAGE_SHAPE_DEC_HR = 9   /* cascade: 1024^3 shape decoder          */
+    T2_STAGE_SHAPE_DEC_HR = 9,  /* cascade: 1024^3 shape decoder          */
+    T2_STAGE_TEXTURE      = 10  /* PBR texture: encode+flow+decode        */
 };
 
 /* Pipeline type for t2_generate. */
@@ -84,6 +85,12 @@ TRELLIS2_CAPI t2_pipeline * t2_pipeline_load(const char * dino_gguf,
                                              const char * slat_flow_gguf,
                                              const char * slat_hr_flow_gguf,
                                              const char * shape_dec_gguf,
+                                             /* PBR texturing (optional; NULL/"" to disable). The tex
+                                             ** models are loaded lazily per-generate, not held resident. */
+                                             const char * shape_enc_gguf,
+                                             const char * tex_dec_gguf,
+                                             const char * tex_flow_gguf,
+                                             const char * tex_flow_hr_gguf,
                                              int flags,
                                              char * err, int err_len);
 
@@ -113,6 +120,10 @@ TRELLIS2_CAPI int           t2_mesh_n_tris (const t2_mesh_result * r);
 TRELLIS2_CAPI const float * t2_mesh_verts  (const t2_mesh_result * r); /* 3*n_verts   */
 TRELLIS2_CAPI const float * t2_mesh_normals(const t2_mesh_result * r); /* 3*n_verts   */
 TRELLIS2_CAPI const int *   t2_mesh_tris   (const t2_mesh_result * r); /* 3*n_tris    */
+/* Per-vertex PBR (5*n_verts: base_color rgb, metallic, roughness), or NULL when
+** the mesh is untextured. t2_mesh_has_pbr reports availability. */
+TRELLIS2_CAPI int           t2_mesh_has_pbr(const t2_mesh_result * r);
+TRELLIS2_CAPI const float * t2_mesh_pbr    (const t2_mesh_result * r); /* 5*n_verts   */
 TRELLIS2_CAPI void          t2_mesh_free   (t2_mesh_result * r);
 
 /* Image decode + TRELLIS.2 preprocessing only (no models). out_rgb must hold

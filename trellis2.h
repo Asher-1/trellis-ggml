@@ -318,6 +318,14 @@ struct trellis2_slat_flow_hparams {
     float   norm_mean[64]  = {0};
     float   norm_std[64]   = {0};
 
+    // Texture SLAT flow only (concat_cond). 0 on the shape flow. When > 0 the DiT
+    // is conditioned on the shape via concatenation: in_channels = out_channels +
+    // concat_cond_channels (64 = 32 tex-noise + 32 shape-SLAT). The shape SLAT is
+    // normalized by concat_norm_* before being concatenated onto the noise.
+    int32_t concat_cond_channels = 0;
+    float   concat_norm_mean[64] = {0};
+    float   concat_norm_std[64]  = {0};
+
     int32_t head_dim() const { return num_heads ? model_channels / num_heads : 0; }
 };
 
@@ -358,6 +366,21 @@ trellis2_slat_flow_sample(trellis2_slat_flow_model * m,
                           const trellis2_ss_sampler_params * params,
                           const float * noise, bool denormalize,
                           float * out_latent, std::string * error = nullptr);
+
+// Texture-SLAT flow sampling with concat_cond (requires concat_cond_channels>0).
+// Diffuses out_channels (32) and, each step, concatenates the shape SLAT
+// (normalized by concat_norm_*) onto the noise so the DiT sees in_channels (64).
+//   shape_slat : [L * concat_cond_channels] the (un-normalized) shape SLAT.
+//   noise      : [L * out_channels] initial noise, or null to seed from params.
+//   out_latent : [L * out_channels]; when denormalize, * norm_std + norm_mean.
+TRELLIS2_API bool
+trellis2_slat_flow_sample_tex(trellis2_slat_flow_model * m,
+                              int n_voxels, const int32_t * coords,
+                              const float * cond, int cond_tokens, int cond_channels,
+                              const float * shape_slat,
+                              const trellis2_ss_sampler_params * params,
+                              const float * noise, bool denormalize,
+                              float * out_latent, std::string * error = nullptr);
 
 /*****************************************************************************
 ** Public API – Shape-SLAT VAE decoder (FlexiDualGridVaeDecoder)
@@ -428,6 +451,100 @@ trellis2_shape_dec_upsample(trellis2_shape_dec_model * m,
                             int upsample_times,
                             std::vector<int32_t> & out_coords,
                             std::string * error = nullptr);
+
+/*****************************************************************************
+** Public API – Shape-SLAT VAE encoder (FlexiDualGridVaeEncoder) — texturing
+**
+** The mirror of the shape decoder: a 6-channel dual grid ([offset(3),
+** intersected(3)] per active voxel at resolution R) is downsampled 16x through
+** SparseSpatial2Channel (S2C) blocks into a 32-channel latent at R/16 (the
+** "shape SLAT", used as concat_cond by the texture flow). Because the input
+** dual grid can be taken straight from the shape decoder's own 7-channel output
+** (offset = (1+2m)sigmoid(f[0:3])-m, intersected = f[3:6]>0), no CUDA QEF
+** re-encode is needed. The per-level subdivision recorded by each S2C is handed
+** to the texture decoder (which has pred_subdiv=False) so it reconstructs
+** exactly this voxel set.
+*****************************************************************************/
+
+struct trellis2_shape_enc_hparams {
+    int32_t in_channels     = 6;    // [offset(3), intersected(3)]
+    int32_t latent_channels = 0;    // 32
+    int32_t n_levels        = 0;    // 5
+    int32_t channels[8]     = {0};  // [64, 128, 256, 512, 1024]
+    int32_t num_blocks[8]   = {0};  // [0, 4, 8, 16, 4]
+    float   norm_eps        = 1e-6f;
+    int32_t file_type       = 0;
+};
+
+// One S2C level, in decoder order (subs[0] is the coarsest upsample the tex
+// decoder runs first). For each fine (output) voxel: its coordinate and the
+// gather index cidx = subidx + 8*parent_row into the coarse [C*8, L_coarse]
+// features — the exact SparseChannel2Spatial replay the tex decoder consumes.
+struct trellis2_subdiv_level {
+    std::vector<int32_t> fine_coords;   // [Lf * 3]
+    std::vector<int32_t> cidx;          // [Lf]
+};
+
+struct trellis2_shape_enc_model;
+
+TRELLIS2_API trellis2_shape_enc_model *
+trellis2_shape_enc_load(const std::string & path,
+                        bool load_tensors = true,
+                        std::string * error = nullptr,
+                        const char * device = nullptr);
+
+TRELLIS2_API void trellis2_shape_enc_free(trellis2_shape_enc_model * m);
+TRELLIS2_API const char * trellis2_shape_enc_backend_name(const trellis2_shape_enc_model * m);
+TRELLIS2_API const trellis2_shape_enc_hparams &
+trellis2_shape_enc_hparams_of(const trellis2_shape_enc_model * m);
+
+// Encode the dual grid into the shape SLAT.
+//   in6        : [N * 6] floats voxel-major = [offset(3), intersected(3)] (the
+//                encoder subtracts 0.5 internally, matching the reference).
+//   coords     : [N * 3] int32 at resolution R.
+//   out_slat   : filled with [Nl * latent_channels] floats, voxel-major.
+//   out_coords : filled with [Nl * 3] int32 at R/16.
+//   out_subs   : filled with (n_levels-1) subdivision levels in decoder order.
+TRELLIS2_API bool
+trellis2_shape_enc_encode(trellis2_shape_enc_model * m,
+                          const float * in6, int n_voxels, const int32_t * coords,
+                          std::vector<float> & out_slat,
+                          std::vector<int32_t> & out_coords,
+                          std::vector<trellis2_subdiv_level> & out_subs,
+                          trellis2_shape_dec_taps * taps = nullptr,
+                          std::string * error = nullptr);
+
+/*****************************************************************************
+** Public API – Texture-SLAT VAE decoder (SparseUnetVaeDecoder, pred_subdiv=False)
+**
+** Architecturally the shape decoder with two differences: it does NOT predict
+** the subdivision (it replays the encoder's recorded subdivision via `subs`)
+** and it emits 6 PBR channels (base_color[3], metallic, roughness, alpha),
+** already mapped to [0,1] (the reference's *0.5+0.5). Reuses the shape-decoder
+** model struct/loader/driver.
+*****************************************************************************/
+
+// Load a trellis2-tex-dec GGUF (returns a shape_dec model with out_channels=6).
+TRELLIS2_API trellis2_shape_dec_model *
+trellis2_tex_dec_load(const std::string & path,
+                      bool load_tensors = true,
+                      std::string * error = nullptr,
+                      const char * device = nullptr);
+
+// Decode the (denormalized) texture SLAT into per-voxel PBR, replaying `subs`.
+//   slat       : [L * latent_channels] tex SLAT, voxel-major.
+//   coords     : [L * 3] latent voxels (== the shape SLAT coords).
+//   subs       : the encoder's per-level subdivisions (decoder order).
+//   out_feats  : [M * 6] PBR, voxel-major, already in [0,1].
+//   out_coords : [M * 3] at R; a permutation-free reproduction of the encoder's
+//                input voxel order (so PBR voxel v == mesh vertex v).
+TRELLIS2_API bool
+trellis2_tex_dec_decode(trellis2_shape_dec_model * m,
+                        const float * slat, int n_voxels, const int32_t * coords,
+                        const std::vector<trellis2_subdiv_level> & subs,
+                        std::vector<float> & out_feats,
+                        std::vector<int32_t> & out_coords,
+                        std::string * error = nullptr);
 
 // Free VRAM (bytes) on the first GPU backend device, or 0 when there is no GPU
 // (CPU-only build/host). Used to auto-place the shape decoder and to decide

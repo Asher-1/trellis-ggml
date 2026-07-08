@@ -12,11 +12,13 @@
 #include "marching_cubes.h"
 #include "flexible_dual_grid.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -49,18 +51,25 @@ struct t2_pipeline {
     std::string backend;
     bool fine = false;      // 512 dual-grid available
     bool cascade = false;   // 1024 cascade available
+    bool texture = false;   // PBR texturing available (shape_enc + tex_dec + tex_flow)
     int  flags = 0;
     bool shapedec_gpu = false;   // shape decoder placed on the GPU (VRAM permitting)
     // gguf paths, so the flow DiTs can be freed to make VRAM room for a GPU
     // decode and lazily reloaded on the next generate (see ensure_decode_vram).
     std::string ss_flow_path, slat_path, slat_hr_path;
+    // Texture-stage gguf paths. The tex models (~4 GB) are loaded lazily inside
+    // the texture stage — after the geometry flow DiTs are freed — and freed
+    // again, so they never coexist in VRAM with the geometry flows.
+    std::string shapeenc_path, texdec_path, texflow_path, texflow_hr_path;
 };
 
-// A generated mesh: verts (3/vertex), normals (3/vertex), tris (3/tri).
+// A generated mesh: verts (3/vertex), normals (3/vertex), tris (3/tri), and
+// optional per-vertex PBR (5/vertex: base_color rgb, metallic, roughness).
 struct t2_mesh_result {
     std::vector<float> verts;
     std::vector<float> normals;
     std::vector<int>   tris;
+    std::vector<float> pbr;   // empty when untextured
 };
 
 namespace {
@@ -95,6 +104,90 @@ void ensure_decode_vram(t2_pipeline * p, int pipeline_type) {
     trellis2_slat_flow_free(p->slat_hr); p->slat_hr = nullptr;
 }
 
+inline uint64_t vox_key(int32_t a, int32_t b, int32_t c) {
+    return ((uint64_t) (uint32_t) a << 42) | ((uint64_t) (uint32_t) b << 21) | (uint64_t) (uint32_t) c;
+}
+
+// PBR-texture stage on the freshly decoded dual grid: encode the shape SLAT,
+// sample the texture SLAT (concat_cond on the shape SLAT), decode to per-voxel
+// PBR, and map it onto the mesh vertices (vertex v == decode voxel v). The tex
+// models (~4 GB) are loaded here — after the geometry flow DiTs are freed by
+// ensure_decode_vram — and freed on return, so they never coexist in VRAM.
+bool run_texture_stage(t2_pipeline * p,
+                       const std::vector<float> & dec_feats,
+                       const std::vector<int32_t> & dec_coords, int pt,
+                       const trellis2_dino_cond & cond, uint64_t seed,
+                       t2_progress_fn progress, void * user,
+                       std::vector<float> & pbr_out, std::string & e) {
+    const int nvox = (int) (dec_coords.size() / 3);
+    if (progress) progress(user, T2_STAGE_TEXTURE, 0, 0);
+
+    // 6-ch encoder input from the 7-ch dual grid: dual-vertex offset
+    // ((1+2m)sigmoid(f)-m) and intersection flag (f > 0).
+    const float mg = 0.5f;
+    std::vector<float> in6((size_t) nvox * 6);
+    for (int v = 0; v < nvox; ++v) {
+        const float * f = dec_feats.data() + (size_t) v * 7;
+        for (int c = 0; c < 3; ++c) {
+            const float s = 1.0f / (1.0f + std::exp(-f[c]));
+            in6[(size_t) v * 6 + c]     = (1.0f + 2.0f * mg) * s - mg;
+            in6[(size_t) v * 6 + 3 + c] = f[3 + c] > 0.0f ? 1.0f : 0.0f;
+        }
+    }
+
+    trellis2_shape_enc_model * enc = trellis2_shape_enc_load(p->shapeenc_path.c_str(), true, &e);
+    if (!enc) { e = "shape_enc load: " + e; return false; }
+    std::vector<float> shape_slat; std::vector<int32_t> lat_coords;
+    std::vector<trellis2_subdiv_level> subs;
+    bool ok = trellis2_shape_enc_encode(enc, in6.data(), nvox, dec_coords.data(),
+                                        shape_slat, lat_coords, subs, nullptr, &e);
+    trellis2_shape_enc_free(enc);
+    if (!ok) { e = "shape encode: " + e; return false; }
+    const int Nl = (int) (lat_coords.size() / 3);
+
+    // texture SLAT flow (concat_cond). 1024 mesh -> texflow_hr when available.
+    const std::string & fp = (pt == T2_PIPE_1024 && !p->texflow_hr_path.empty())
+                             ? p->texflow_hr_path : p->texflow_path;
+    trellis2_slat_flow_model * flow = trellis2_slat_flow_load(fp.c_str(), true, &e);
+    if (!flow) { e = "tex_flow load: " + e; return false; }
+    std::vector<float> tex_slat((size_t) Nl * 32);
+    trellis2_ss_sampler_params tp;   // texturing_pipeline.json tex_slat_sampler
+    tp.steps = 12; tp.guidance_strength = 1.0f; tp.guidance_rescale = 0.0f;
+    tp.guidance_interval_min = 0.6f; tp.guidance_interval_max = 0.9f; tp.rescale_t = 3.0f;
+    tp.seed = seed ^ 0x7e00ULL; tp.verbose = false;
+    ok = trellis2_slat_flow_sample_tex(flow, Nl, lat_coords.data(),
+                                       cond.data.data(), (int) cond.tokens(), (int) cond.channels(),
+                                       shape_slat.data(), &tp, nullptr, /*denormalize*/ true,
+                                       tex_slat.data(), &e);
+    trellis2_slat_flow_free(flow);
+    if (!ok) { e = "tex sample: " + e; return false; }
+
+    // texture decoder -> per-voxel 6-ch PBR, replaying the encoder's subdivision.
+    trellis2_shape_dec_model * texdec = trellis2_tex_dec_load(p->texdec_path.c_str(), true, &e);
+    if (!texdec) { e = "tex_dec load: " + e; return false; }
+    std::vector<float> pbr; std::vector<int32_t> pbr_coords;
+    ok = trellis2_tex_dec_decode(texdec, tex_slat.data(), Nl, lat_coords.data(),
+                                 subs, pbr, pbr_coords, &e);
+    trellis2_shape_dec_free(texdec);
+    if (!ok) { e = "tex decode: " + e; return false; }
+
+    // map PBR onto mesh vertices by voxel coord (robust to ordering). 5/vertex.
+    const int M = (int) (pbr_coords.size() / 3);
+    std::unordered_map<uint64_t, int> pm;
+    pm.reserve((size_t) M * 2);
+    for (int i = 0; i < M; ++i)
+        pm[vox_key(pbr_coords[(size_t) i*3], pbr_coords[(size_t) i*3+1], pbr_coords[(size_t) i*3+2])] = i;
+    pbr_out.assign((size_t) nvox * 5, 0.5f);
+    for (int v = 0; v < nvox; ++v) {
+        auto it = pm.find(vox_key(dec_coords[(size_t) v*3], dec_coords[(size_t) v*3+1], dec_coords[(size_t) v*3+2]));
+        if (it == pm.end()) continue;
+        const float * s = pbr.data() + (size_t) it->second * 6;
+        float * d = pbr_out.data() + (size_t) v * 5;
+        d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3]; d[4] = s[4];
+    }
+    return true;
+}
+
 } // namespace
 
 extern "C" {
@@ -107,6 +200,10 @@ t2_pipeline * t2_pipeline_load(const char * dino_gguf,
                                const char * slat_flow_gguf,
                                const char * slat_hr_flow_gguf,
                                const char * shape_dec_gguf,
+                               const char * shape_enc_gguf,
+                               const char * tex_dec_gguf,
+                               const char * tex_flow_gguf,
+                               const char * tex_flow_hr_gguf,
                                int flags,
                                char * err, int err_len) {
     std::string e;
@@ -170,6 +267,21 @@ t2_pipeline * t2_pipeline_load(const char * dino_gguf,
             p->slat_hr = trellis2_slat_flow_load(slat_hr_flow_gguf, true, &e);
             if (!p->slat_hr) { copy_err(err, err_len, "slat_hr_flow: " + e); t2_pipeline_free(p); return nullptr; }
             p->cascade = true;
+        }
+
+        // PBR texturing: enabled when the shape encoder, tex decoder, and (at
+        // least the 512) tex flow are all present. The tex models are loaded
+        // lazily per-generate (run_texture_stage), so only their paths are kept.
+        if (present(shape_enc_gguf) && present(tex_dec_gguf) && present(tex_flow_gguf)) {
+            std::string ve;
+            trellis2_shape_enc_model * te = trellis2_shape_enc_load(shape_enc_gguf, false, &ve);
+            if (!te) { copy_err(err, err_len, "shape_enc: " + ve); t2_pipeline_free(p); return nullptr; }
+            trellis2_shape_enc_free(te);
+            p->shapeenc_path   = shape_enc_gguf;
+            p->texdec_path     = tex_dec_gguf;
+            p->texflow_path    = tex_flow_gguf;
+            p->texflow_hr_path = present(tex_flow_hr_gguf) ? tex_flow_hr_gguf : "";
+            p->texture = true;
         }
     }
 
@@ -400,6 +512,7 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
     std::vector<float> dec_feats;      // 7-ch decoder output to mesh
     std::vector<int32_t> dec_coords;
     int grid = 0;
+    trellis2_dino_cond cond1024;       // filled by the cascade branch; reused by texturing
 
     if (pt == T2_PIPE_512) {
         // ── 512 fine: decode the LR slat directly at grid 512 ────────────────
@@ -444,7 +557,6 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         if (t2_preprocess_image_bytes(image_bytes, image_len, 1024, rgb1024.data(), perr, sizeof(perr))) {
             copy_err(err, err_len, perr); delete r; return nullptr;
         }
-        trellis2_dino_cond cond1024;
         if (!trellis2_dino_encode_rgb(p->dino, rgb1024.data(), 1024, cond1024, &e)) {
             copy_err(err, err_len, "dino encode 1024: " + e); delete r; return nullptr;
         }
@@ -481,6 +593,27 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
     r->verts   = std::move(mesh.verts);
     r->tris    = std::move(mesh.tris);
     r->normals = fdg::vertex_normals(fdg::Mesh{r->verts, r->tris});
+
+    // ── PBR texture stage (optional) ─────────────────────────────────────────
+    if (p->texture && pt != T2_PIPE_COARSE) {
+        // Free the (finished) geometry flow DiTs so the ~4 GB of tex models fit
+        // in VRAM; reload_flows() restores them on the next generate.
+        if (trellis2_gpu_free_vram() > 0) {
+            if (p->flow)    { trellis2_ss_flow_free(p->flow);      p->flow    = nullptr; }
+            if (p->slat)    { trellis2_slat_flow_free(p->slat);    p->slat    = nullptr; }
+            if (p->slat_hr) { trellis2_slat_flow_free(p->slat_hr); p->slat_hr = nullptr; }
+        }
+        const trellis2_dino_cond & texcond = (pt == T2_PIPE_1024) ? cond1024 : cond;
+        std::vector<float> pbr;
+        std::string te;
+        if (run_texture_stage(p, dec_feats, dec_coords, pt, texcond, seed ^ 0x7ec0ULL,
+                              progress, user, pbr, te)) {
+            r->pbr = std::move(pbr);
+        } else {
+            // texturing failure is non-fatal — return the untextured mesh
+            std::fprintf(stderr, "[texture] failed: %s (returning untextured mesh)\n", te.c_str());
+        }
+    }
     return r;
 }
 
@@ -489,6 +622,8 @@ int t2_mesh_n_tris (const t2_mesh_result * r) { return r ? (int) (r->tris.size()
 const float * t2_mesh_verts  (const t2_mesh_result * r) { return r ? r->verts.data()   : nullptr; }
 const float * t2_mesh_normals(const t2_mesh_result * r) { return r ? r->normals.data() : nullptr; }
 const int *   t2_mesh_tris   (const t2_mesh_result * r) { return r ? r->tris.data()    : nullptr; }
+int t2_mesh_has_pbr(const t2_mesh_result * r) { return (r && !r->pbr.empty()) ? 1 : 0; }
+const float * t2_mesh_pbr(const t2_mesh_result * r) { return (r && !r->pbr.empty()) ? r->pbr.data() : nullptr; }
 void t2_mesh_free(t2_mesh_result * r) { delete r; }
 
 } // extern "C"
