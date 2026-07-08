@@ -6,6 +6,7 @@
 
 #include "trellis2_capi.h"
 #include "trellis2.h"
+#include "mesh_export.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -625,5 +626,29 @@ const int *   t2_mesh_tris   (const t2_mesh_result * r) { return r ? r->tris.dat
 int t2_mesh_has_pbr(const t2_mesh_result * r) { return (r && !r->pbr.empty()) ? 1 : 0; }
 const float * t2_mesh_pbr(const t2_mesh_result * r) { return (r && !r->pbr.empty()) ? r->pbr.data() : nullptr; }
 void t2_mesh_free(t2_mesh_result * r) { delete r; }
+
+uint8_t * t2_bake_glb(const float * verts, int n_verts, const int * tris, int n_tris,
+                      const float * pbr, int texture_size, int target_tris,
+                      int * out_len, char * err, int err_len) {
+    if (out_len) *out_len = 0;
+    if (!verts || !tris || n_verts <= 0 || n_tris <= 0) {
+        copy_err(err, err_len, "empty mesh"); return nullptr;
+    }
+    t2glb::MeshExportOptions opt;
+    if (texture_size > 0) opt.texture_size = texture_size;
+    if (target_tris  > 0) opt.target_tris  = target_tris;
+    std::vector<uint8_t> glb;
+    std::string e;
+    if (!t2glb::mesh_to_glb(verts, n_verts, tris, n_tris, pbr, opt, glb, e)) {
+        copy_err(err, err_len, e); return nullptr;
+    }
+    uint8_t * buf = (uint8_t *) std::malloc(glb.size());
+    if (!buf) { copy_err(err, err_len, "out of memory"); return nullptr; }
+    std::memcpy(buf, glb.data(), glb.size());
+    if (out_len) *out_len = (int) glb.size();
+    return buf;
+}
+
+void t2_free_buffer(uint8_t * buf) { std::free(buf); }
 
 } // extern "C"

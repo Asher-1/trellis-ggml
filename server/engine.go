@@ -12,7 +12,7 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-const abiVersion = 3
+const abiVersion = 4
 
 // Progress stages (enum t2_stage).
 const (
@@ -78,6 +78,9 @@ type engine struct {
 	meshHasPBR   func(r uintptr) int32
 	meshPBR      func(r uintptr) uintptr
 	meshFree     func(r uintptr)
+	bakeGLB      func(verts unsafe.Pointer, nv int32, tris unsafe.Pointer, nt int32, pbr unsafe.Pointer,
+		texSize, targetTris int32, outLen unsafe.Pointer, err unsafe.Pointer, errLen int32) uintptr
+	freeBuffer func(buf uintptr)
 }
 
 // progressSink receives per-stage/step updates for the currently running
@@ -117,6 +120,8 @@ func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shape
 	purego.RegisterLibFunc(&e.meshHasPBR, lib, "t2_mesh_has_pbr")
 	purego.RegisterLibFunc(&e.meshPBR, lib, "t2_mesh_pbr")
 	purego.RegisterLibFunc(&e.meshFree, lib, "t2_mesh_free")
+	purego.RegisterLibFunc(&e.bakeGLB, lib, "t2_bake_glb")
+	purego.RegisterLibFunc(&e.freeBuffer, lib, "t2_free_buffer")
 
 	if progressCallback == 0 {
 		progressCallback = purego.NewCallback(func(user unsafe.Pointer, stage, step, total int32) uintptr {
@@ -197,6 +202,32 @@ func (e *engine) Generate(image []byte, pipelineType int, seed uint64, steps int
 		m.PBR = copyFloats(e.meshPBR(r), 5*nv)
 	}
 	return m, nil
+}
+
+// BakeGLB turns a generated mesh into a UV-atlas-textured GLB (glTF binary).
+// texSize is the atlas resolution hint; targetTris the decimation target (0 for
+// defaults). CPU-only; serialized C-side, so it can run while the GPU is idle.
+func (e *engine) BakeGLB(m *meshData, texSize, targetTris int) ([]byte, error) {
+	if m == nil || m.NVerts == 0 || m.NTris == 0 {
+		return nil, fmt.Errorf("empty mesh")
+	}
+	var pbr unsafe.Pointer
+	if len(m.PBR) == 5*m.NVerts {
+		pbr = unsafe.Pointer(&m.PBR[0])
+	}
+	var outLen int32
+	errBuf := make([]byte, 512)
+	p := e.bakeGLB(unsafe.Pointer(&m.Verts[0]), int32(m.NVerts),
+		unsafe.Pointer(&m.Tris[0]), int32(m.NTris), pbr,
+		int32(texSize), int32(targetTris),
+		unsafe.Pointer(&outLen), unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
+	if p == 0 {
+		return nil, fmt.Errorf("%s", cstr(errBuf))
+	}
+	defer e.freeBuffer(p)
+	out := make([]byte, outLen)
+	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(p)), int(outLen)))
+	return out, nil
 }
 
 func copyFloats(p uintptr, n int) []float32 {

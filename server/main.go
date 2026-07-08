@@ -50,6 +50,8 @@ type job struct {
 	steps    int
 	guidance float32
 	mesh     *meshData
+	glb      []byte // cached last GLB bake
+	glbKey   string // "tex-tris" the cached GLB was baked with
 }
 
 type server struct {
@@ -207,6 +209,54 @@ func (s *server) handleMesh(w http.ResponseWriter, r *http.Request) {
 	binary.Write(w, binary.LittleEndian, mesh.Tris)
 }
 
+// handleGLB bakes the mesh into a UV-atlas-textured GLB on demand and streams
+// it as a download. Result is cached per (tex,tris) on the job so re-requests
+// are free. Baking is CPU-bound and can take a few seconds for the dense mesh.
+func (s *server) handleGLB(w http.ResponseWriter, r *http.Request) {
+	j := s.getJob(r, "/api/glb/")
+	if j == nil {
+		http.Error(w, "no such job", http.StatusNotFound)
+		return
+	}
+	j.mu.Lock()
+	mesh := j.mesh
+	j.mu.Unlock()
+	if mesh == nil {
+		http.Error(w, "mesh not ready", http.StatusConflict)
+		return
+	}
+
+	tex := int(formUint(r, "tex", 2048))
+	tris := int(formUint(r, "tris", 150000))
+	if tex < 256 || tex > 4096 {
+		tex = 2048
+	}
+	if tris < 1000 || tris > 4000000 {
+		tris = 150000
+	}
+	key := fmt.Sprintf("%d-%d", tex, tris)
+
+	j.mu.Lock()
+	glb, cached := j.glb, j.glbKey == key && j.glb != nil
+	j.mu.Unlock()
+
+	if !cached {
+		var err error
+		glb, err = s.eng.BakeGLB(mesh, tex, tris)
+		if err != nil {
+			http.Error(w, "bake glb: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		j.mu.Lock()
+		j.glb, j.glbKey = glb, key
+		j.mu.Unlock()
+	}
+
+	w.Header().Set("Content-Type", "model/gltf-binary")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"trellis2-%s.glb\"", j.ID))
+	w.Write(glb)
+}
+
 func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	qualities := []string{"coarse"}
 	if s.eng.caps&cap512 != 0 {
@@ -351,6 +401,7 @@ func main() {
 	mux.HandleFunc("/api/generate", s.handleGenerate)
 	mux.HandleFunc("/api/job/", s.handleJob)
 	mux.HandleFunc("/api/mesh/", s.handleMesh)
+	mux.HandleFunc("/api/glb/", s.handleGLB)
 
 	log.Printf("listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))

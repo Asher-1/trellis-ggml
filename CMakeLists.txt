@@ -46,19 +46,33 @@ else()
     set(TRELLIS2_GGML_TARGET ggml)
 endif()
 
-add_library(trellis2 trellis2.cpp trellis2.h trellis2_capi.cpp trellis2_capi.h)
+add_library(trellis2
+    trellis2.cpp trellis2.h
+    trellis2_capi.cpp trellis2_capi.h
+    mesh_export.cpp mesh_export.h
+    third_party/xatlas/xatlas.cpp
+    third_party/meshoptimizer/simplifier.cpp
+    third_party/meshoptimizer/indexgenerator.cpp
+    third_party/meshoptimizer/vfetchoptimizer.cpp
+    third_party/meshoptimizer/allocator.cpp)
 target_include_directories(trellis2 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/stb
 )
-# trellis2_capi.cpp reuses the example isosurface extractor for the demo path.
-target_include_directories(trellis2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
+# trellis2_capi.cpp reuses the example isosurface extractor for the demo path;
+# mesh_export.cpp vendors xatlas (UV unwrap) and Simplify.h (QEM decimation).
+target_include_directories(trellis2 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xatlas
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/meshoptimizer)
+
+find_package(Threads REQUIRED)  # xatlas uses std::thread
 
 if(TRELLIS2_USE_EXTERNAL_GGML AND DEFINED GGML_INCLUDE_DIR)
     target_include_directories(trellis2 PUBLIC ${GGML_INCLUDE_DIR})
 endif()
 
-target_link_libraries(trellis2 PUBLIC ${TRELLIS2_GGML_TARGET})
+target_link_libraries(trellis2 PUBLIC ${TRELLIS2_GGML_TARGET} PRIVATE Threads::Threads)
 target_compile_features(trellis2 PUBLIC cxx_std_14)
 
 set_property(TARGET trellis2 PROPERTY POSITION_INDEPENDENT_CODE ON)

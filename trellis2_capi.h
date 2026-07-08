@@ -26,7 +26,7 @@
 extern "C" {
 #endif
 
-#define T2_CAPI_ABI_VERSION 3
+#define T2_CAPI_ABI_VERSION 4
 
 TRELLIS2_CAPI int t2_abi_version(void);
 
@@ -125,6 +125,23 @@ TRELLIS2_CAPI const int *   t2_mesh_tris   (const t2_mesh_result * r); /* 3*n_tr
 TRELLIS2_CAPI int           t2_mesh_has_pbr(const t2_mesh_result * r);
 TRELLIS2_CAPI const float * t2_mesh_pbr    (const t2_mesh_result * r); /* 5*n_verts   */
 TRELLIS2_CAPI void          t2_mesh_free   (t2_mesh_result * r);
+
+/* Bake a mesh into a portable UV-atlas-textured GLB (glTF 2.0 binary): QEM
+** decimate -> xatlas UV unwrap -> per-texel PBR bake (from the dense per-vertex
+** attributes) -> gutter inpaint -> glTF. All CPU, no CUDA.
+**   verts  3*n_verts, tris  3*n_tris, pbr  5*n_verts (base_color rgb, metallic,
+**   roughness) or NULL for an untextured grey bake.
+**   texture_size  square atlas resolution hint (e.g. 2048; <=0 -> default).
+**   target_tris   decimation target triangle count (<=0 -> default).
+** Operates on raw arrays so hosts can bake straight from their own buffers.
+** On success returns a malloc'd GLB buffer (free with t2_free_buffer) and writes
+** its length to *out_len; on failure returns NULL with a reason in err. */
+TRELLIS2_CAPI uint8_t * t2_bake_glb(const float * verts, int n_verts,
+                                    const int * tris, int n_tris,
+                                    const float * pbr,
+                                    int texture_size, int target_tris,
+                                    int * out_len, char * err, int err_len);
+TRELLIS2_CAPI void      t2_free_buffer(uint8_t * buf);
 
 /* Image decode + TRELLIS.2 preprocessing only (no models). out_rgb must hold
 ** out_size*out_size*3 bytes. Returns 0 on success, nonzero on failure (reason

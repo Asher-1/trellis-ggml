@@ -95,6 +95,7 @@
     <div class="toggles">
       <button id="twire">wireframe</button>
       <button id="tspin" class="on">auto-rotate</button>
+      <button id="dglb" style="display:none">download GLB</button>
     </div>
     <footer>coarse-geometry preview (64&sup3; sparse structure stage);
     fine SLAT geometry lands next. Meshes are watertight OBJ-grade
@@ -257,7 +258,35 @@ async function loadMesh(id) {
   $("meshinfo").textContent = `${nv.toLocaleString()} vertices · ${nt.toLocaleString()} triangles`
     + (textured ? " · PBR" : "");
   viewer.setMesh(verts, normals, tris, pbr);
+  glbJobId = id;
+  $("dglb").style.display = "";
+  $("dglb").disabled = false;
+  $("dglb").textContent = "download GLB";
 }
+
+// Bake + download a UV-atlas-textured GLB for the last-loaded mesh.
+let glbJobId = null;
+$("dglb").addEventListener("click", async () => {
+  if (!glbJobId) return;
+  const btn = $("dglb");
+  btn.disabled = true; btn.textContent = "baking GLB…";
+  try {
+    const r = await fetch("/api/glb/" + glbJobId);
+    if (!r.ok) throw new Error(await r.text());
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "trellis2-" + glbJobId + ".glb";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    btn.textContent = "download GLB";
+  } catch (e) {
+    setStatus("GLB bake failed: " + e.message, true);
+    btn.textContent = "download GLB";
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 /* ── WebGL2 mesh viewer ─────────────────────────────────────────────────── */
 const viewer = (() => {

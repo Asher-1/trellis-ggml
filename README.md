@@ -1,9 +1,10 @@
 # trellis2.cpp
 
 A C++/[ggml](https://github.com/ggml-org/ggml) implementation of the
-**TRELLIS.2** image-to-3D geometry pipeline: an image goes in, a 3D mesh comes
-out, with all inference in C++/ggml (no PyTorch at runtime). No PBR textures
-yet — geometry only.
+**TRELLIS.2** image-to-3D pipeline: an image goes in, a 3D mesh with per-vertex
+PBR textures comes out, with all inference in C++/ggml (no PyTorch at runtime).
+The demo can also bake the result into a portable, image-textured **GLB** —
+CUDA-free UV atlas + PBR bake, no reference container required.
 
 Modeled structurally after [sam3.cpp](https://github.com/rms80/sam3.cpp):
 single-file library (`trellis2.h` / `trellis2.cpp`), bundled ggml as a
@@ -230,11 +231,16 @@ reduction.
 | `trellis2.cpp` | implementation                                         |
 | `convert_ss_flow_to_gguf.py` | stage-1 DiT checkpoint → GGUF converter  |
 | `convert_ss_dec_to_gguf.py`  | stage-1 decoder checkpoint → GGUF converter |
-| `examples/`    | CLI tools (`dino_info`, `ss_flow_info`, `ss_sample`, `ss_decode`, `ss_mesh`) |
+| `mesh_export.{h,cpp}` | CUDA-free textured-GLB bake: decimate → UV atlas → PBR bake → glTF |
+| `examples/`    | CLI tools (`dino_info`, `ss_flow_info`, `ss_sample`, `ss_decode`, `ss_mesh`, `mesh2glb`) |
 | `examples/marching_cubes.h` | single-file isosurface → OBJ extractor      |
+| `third_party/` | vendored `meshoptimizer` (QEM decimate) + `xatlas` (opt-in charts) |
 | `ggml/`        | submodule, pinned to the same commit as sam3.cpp       |
 | `stb/`         | `stb_image.h` / `stb_image_write.h` for image I/O      |
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Vendored third-party code is also MIT:
+[meshoptimizer](https://github.com/zeux/meshoptimizer) (Arseny Kapoulkine) and
+[xatlas](https://github.com/jpcy/xatlas) (Jonathan Young) under `third_party/`,
+and `stb` (public domain / MIT).
