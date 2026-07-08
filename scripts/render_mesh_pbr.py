@@ -35,16 +35,36 @@ def R(el, az):
     return Rx @ Ry
 
 
+rough = pbr[:, 4] if pbr is not None else np.full(nv, 0.55)
+# view-space metallic-roughness PBR, matching server/web/index.html
+LC = [(np.array([.32, .55, .77]), np.array([1., .96, .88]), .85),
+      (np.array([-.65, .20, .45]), np.array([.70, .80, 1.]), .45),
+      (np.array([.10, -.75, .35]), np.array([.85, .85, .90]), .25)]
+
+
 def render(el, az):
     r = R(el, az); P = Vc @ r.T; Nr = N @ r.T
+    Nr /= np.linalg.norm(Nr, axis=1, keepdims=True) + 1e-9
     sx = ((P[:, 0]*.5+.5)*(W-1)).astype(np.int32); sy = ((.5-P[:, 1]*.5)*(H-1)).astype(np.int32)
     z = P[:, 2]
-    d = np.abs(Nr @ l1)*.75 + np.abs(Nr @ l2)*.25
-    diff = C * (0.25 + 0.75*d)[:, None] * (1 - 0.7*metal)[:, None]
-    sp = np.clip(d, 0, 1)[:, None]**12 * (0.3 + 0.7*metal)[:, None]
-    col = np.clip(diff + sp*np.where(metal[:, None] > 0.5, C, 0.16), 0, 1)
-    img = np.ones((H, W, 3)); zb = np.full((H, W), -1e9)
-    idx = np.argsort(z); sx, sy, z, col = sx[idx], sy[idx], z[idx], col[idx]
+    V = np.array([0., 0., 1.])
+    nv_ = np.abs(Nr @ V)
+    F0 = 0.04*(1-metal)[:, None] + C*metal[:, None]
+    F = F0 + (1-F0)*((1-nv_)[:, None]**5)
+    shin = 6.0 + (220.0-6.0)*np.clip(1-rough, 0, 1)**1.5
+    sn = (shin+2.0)/(2*np.pi)
+    diffuse = np.zeros((len(C), 3)); specular = np.zeros((len(C), 3))
+    for Ld, Lc, w in LC:
+        l = Ld/np.linalg.norm(Ld); ndl = np.abs(Nr @ l)
+        diffuse += Lc[None]*w*ndl[:, None]
+        h = l+V; h = h/np.linalg.norm(h); nh = np.abs(Nr @ h)
+        specular += Lc[None]*w*(nh[:, None]**shin[:, None])*sn[:, None]*ndl[:, None]
+    albedo = C*(1-metal)[:, None]
+    hemi = np.abs(N[:, 1])*0.5+0.5
+    amb = (1-hemi)[:, None]*np.array([.20, .19, .22]) + hemi[:, None]*np.array([.55, .58, .66])
+    col = np.clip(albedo*(amb*0.55 + diffuse*0.75) + specular*F + F*0.25, 0, 1)
+    img = np.ones((H, W, 3))
+    idx = np.argsort(z); sx, sy, col = sx[idx], sy[idx], col[idx]
     for dx in range(SS+1):
         for dy in range(SS+1):
             xx = sx+dx; yy = sy+dy
