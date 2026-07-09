@@ -440,6 +440,14 @@ const viewer = (() => {
   const gl = canvas.getContext("webgl2", { antialias: true });
   if (!gl) { setStatus("WebGL2 not available", true); return { setMesh(){}, setVoxels(){}, clear(){} }; }
 
+  // Safety net: if the GPU context is ever lost (driver reset / out of memory),
+  // preventDefault keeps it recoverable and we tell the user instead of leaving
+  // a silently-dead black canvas. Rebuilding GL state needs a reload.
+  canvas.addEventListener("webglcontextlost", (e) => {
+    e.preventDefault();
+    setStatus("3D view lost the GPU context — reload the page to restore it.", true);
+  }, false);
+
   const VS = `#version 300 es
   layout(location=0) in vec3 pos;
   layout(location=1) in vec3 nrm;
@@ -534,7 +542,7 @@ const viewer = (() => {
 
   const vao = gl.createVertexArray();
   const vbo = gl.createBuffer(), nbo = gl.createBuffer(), cbo = gl.createBuffer(), ibo = gl.createBuffer();
-  let nIndices = 0, wireIbo = gl.createBuffer(), nWire = 0, hasPBR = false;
+  let nIndices = 0, wireIbo = gl.createBuffer(), nWire = 0, wireStride = 1, hasPBR = false;
 
   /* ── instanced-voxel program (live intermediate previews) ───────────────── */
   // One unit cube drawn once per occupied voxel; the "coarse" blocky look reads
@@ -673,16 +681,25 @@ const viewer = (() => {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
     nIndices = idx.length;
-    // wireframe index buffer (unique-ish edges; duplicates are fine visually)
-    const wireIdx = new Uint32Array(nIndices * 2);
-    for (let t = 0, o = 0; t < nIndices; t += 3) {
+    // wireframe index buffer: 3 edges per triangle. A full per-triangle wireframe
+    // of a multi-million-triangle mesh is pathological — WebGL lines are min 1px
+    // wide, so sub-pixel triangles fill in as a solid mass, AND the buffer/draw
+    // gets so large (a 9M-tri mesh → a 216 MB buffer + 27M line segments) that it
+    // OOMs or stalls the GPU, losing the context and blanking the canvas. So we
+    // bound it to WIRE_BUDGET indices, striding whole triangles above that.
+    const WIRE_BUDGET = 12_000_000;               // ~6M segments, ~48 MB
+    const nTri = nIndices / 3;
+    wireStride = Math.max(1, Math.ceil(nTri * 6 / WIRE_BUDGET));
+    const wireIdx = new Uint32Array(Math.ceil(nTri / wireStride) * 6);
+    let o = 0;
+    for (let t = 0; t < nIndices; t += 3 * wireStride) {
       wireIdx[o++] = idx[t];     wireIdx[o++] = idx[t + 1];
       wireIdx[o++] = idx[t + 1]; wireIdx[o++] = idx[t + 2];
       wireIdx[o++] = idx[t + 2]; wireIdx[o++] = idx[t];
     }
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, wireIbo);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, wireIdx, gl.STATIC_DRAW);
-    nWire = wireIdx.length;
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, wireIdx.subarray(0, o), gl.STATIC_DRAW);
+    nWire = o;
     gl.bindVertexArray(null);
     renderMode = "mesh";
   }
@@ -825,8 +842,15 @@ const viewer = (() => {
           gl.colorMask(true, true, true, true);
           gl.disable(gl.POLYGON_OFFSET_FILL);
           gl.uniform1i(uWire, 1);
+          // Front-surface edges sit at ~equal depth to the offset-back fill, so
+          // LEQUAL lets them pass while occluded edges (greater depth) fail. This
+          // is robust across drivers; plain LESS drops the front edges wherever
+          // the polygon-offset magnitude is small (e.g. NVIDIA vs SwiftShader),
+          // which left the canvas blank (fill is colour-masked, lines gone).
+          gl.depthFunc(gl.LEQUAL);
           gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, wireIbo);
           gl.drawElements(gl.LINES, nWire, gl.UNSIGNED_INT, 0);
+          gl.depthFunc(gl.LESS);
         } else {
           gl.uniform1i(uWire, 0);
           gl.uniform1i(uTextured, hasPBR ? 1 : 0);
