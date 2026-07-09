@@ -13,6 +13,7 @@
 #include "marching_cubes.h"
 #include "flexible_dual_grid.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -108,6 +109,69 @@ void ensure_decode_vram(t2_pipeline * p, int pipeline_type) {
 inline uint64_t vox_key(int32_t a, int32_t b, int32_t c) {
     return ((uint64_t) (uint32_t) a << 42) | ((uint64_t) (uint32_t) b << 21) | (uint64_t) (uint32_t) c;
 }
+
+// ── live intermediate 3D previews (voxel sets) ───────────────────────────────
+//
+// A preview is a self-describing "T2VOX01" blob the host streams to its viewer:
+//   char magic[8] = "T2VOX01\0"; u32 res; u32 nvox; u16 coords[3*nvox] in [0,res)
+// Voxels bound the payload (occupancy is sparse) and read as clearly "coarse"
+// against the final smooth mesh — the stages stay visually distinct.
+
+// Collect the occupied cells (logit > 0) of a dense [res^3] occupancy grid.
+void collect_occupied(const float * occ, int res, std::vector<int32_t> & cells) {
+    cells.clear();
+    for (int x = 0; x < res; ++x)
+    for (int y = 0; y < res; ++y)
+    for (int z = 0; z < res; ++z) {
+        if (occ[((size_t) x * res + y) * res + z] > 0.0f) {
+            cells.push_back(x); cells.push_back(y); cells.push_back(z);
+        }
+    }
+}
+
+// Pack a flat [x,y,z,...] cell list (each in [0,res)) into a T2VOX01 blob.
+void pack_voxels(int res, const std::vector<int32_t> & cells, std::vector<uint8_t> & blob) {
+    const uint32_t nvox = (uint32_t) (cells.size() / 3);
+    const uint32_t r = (uint32_t) res;
+    blob.resize(8 + 4 + 4 + (size_t) nvox * 3 * 2);
+    std::memcpy(blob.data(), "T2VOX01", 8);          // 7 chars + NUL
+    std::memcpy(blob.data() + 8,  &r,    4);
+    std::memcpy(blob.data() + 12, &nvox, 4);
+    uint8_t * dst = blob.data() + 16;
+    for (uint32_t i = 0; i < nvox * 3; ++i) {
+        const uint16_t c = (uint16_t) cells[i];
+        std::memcpy(dst, &c, 2); dst += 2;
+    }
+}
+
+// Pack + hand a voxel preview to the host callback. Best-effort: never fatal.
+void emit_voxels(t2_preview_fn fn, void * user, int stage, int step, int total,
+                 int res, const std::vector<int32_t> & cells) {
+    if (!fn) return;
+    std::vector<uint8_t> blob;
+    pack_voxels(res, cells, blob);
+    fn(user, stage, step, total, blob.data(), (int) blob.size());
+}
+
+// Per-step SS preview cadence: T2_PREVIEW_STRIDE if set, else ~4 across the run.
+int preview_stride(int steps) {
+    if (const char * e = std::getenv("T2_PREVIEW_STRIDE")) {
+        const int s = std::atoi(e);
+        if (s > 0) return s;
+    }
+    return std::max(1, steps / 4);
+}
+
+// Context for the (capture-less) SS-sampler preview trampoline: decode the
+// handed-out x_0 estimate into a 64^3 occupancy and stream it as voxels.
+struct ss_preview_ctx {
+    t2_preview_fn         fn     = nullptr;
+    void *                user   = nullptr;
+    trellis2_ss_dec_model * dec   = nullptr;
+    int                   res    = 0;
+    int                   stride = 1;
+    std::vector<float> *  occ    = nullptr;   // scratch [res^3], caller-owned
+};
 
 // PBR-texture stage on the freshly decoded dual grid: encode the shape SLAT,
 // sample the texture SLAT (concat_cond on the shape SLAT), decode to per-voxel
@@ -363,6 +427,7 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
                              int pipeline_type,
                              uint64_t seed, int steps, float guidance,
                              t2_progress_fn progress, void * user,
+                             t2_preview_fn preview, void * preview_user,
                              char * err, int err_len) {
     if (!p) { copy_err(err, err_len, "null pipeline"); return nullptr; }
     std::string e;
@@ -404,6 +469,12 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         return nullptr;
     }
 
+    // SS-decoder geometry (also the occupancy scratch reused by the live
+    // previews and the settled decode below).
+    const trellis2_ss_dec_hparams & dechp = trellis2_ss_dec_hparams_of(p->dec);
+    const int Rout = dechp.res_out();   // 64
+    std::vector<float> occ((size_t) dechp.out_channels * Rout * Rout * Rout);
+
     trellis2_ss_sampler_params sp;
     if (steps > 0)       sp.steps = steps;
     if (guidance >= 0)   sp.guidance_strength = guidance;
@@ -418,6 +489,23 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         };
         sp.progress_user = &cbc;
     }
+    // Live per-step previews: decode each step's x_0 estimate into 64^3
+    // occupancy and stream it as voxels (stride-gated; the last step is left to
+    // the settled SS_DEC checkpoint below). `pctx`/`occ` outlive the sampler.
+    ss_preview_ctx pctx;
+    if (preview) {
+        pctx = ss_preview_ctx{preview, preview_user, p->dec, Rout, preview_stride(sp.steps), &occ};
+        sp.preview = [](void * u, int step, int total, const float * latent, int /*n*/) {
+            auto * c = (ss_preview_ctx *) u;
+            if (step % c->stride != 0 || step == total) return;
+            std::string de;
+            if (!trellis2_ss_dec_decode(c->dec, latent, c->occ->data(), &de)) return;
+            std::vector<int32_t> cells;
+            collect_occupied(c->occ->data(), c->res, cells);
+            emit_voxels(c->fn, c->user, T2_STAGE_SS_FLOW, step, total, c->res, cells);
+        };
+        sp.preview_user = &pctx;
+    }
 
     const int R = fhp.resolution;
     std::vector<float> latent((size_t) fhp.in_channels * R * R * R);
@@ -429,12 +517,15 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
     }
 
     if (progress) progress(user, T2_STAGE_SS_DEC, 0, 0);
-    const trellis2_ss_dec_hparams & dechp = trellis2_ss_dec_hparams_of(p->dec);
-    const int Rout = dechp.res_out();   // 64
-    std::vector<float> occ((size_t) dechp.out_channels * Rout * Rout * Rout);
     if (!trellis2_ss_dec_decode(p->dec, latent.data(), occ.data(), &e)) {
         copy_err(err, err_len, "ss_dec decode: " + e);
         return nullptr;
+    }
+    // Settled-occupancy checkpoint (the clean sparse structure, 64^3 voxels).
+    if (preview) {
+        std::vector<int32_t> cells;
+        collect_occupied(occ.data(), Rout, cells);
+        emit_voxels(preview, preview_user, T2_STAGE_SS_DEC, 0, 0, Rout, cells);
     }
 
     auto * r = new t2_mesh_result();
@@ -553,6 +644,9 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         const int Lhr = (int) (hr_coords.size() / 3);
         if (Lhr == 0) { copy_err(err, err_len, "empty HR scaffold"); delete r; return nullptr; }
 
+        // Sharper 64^3 HR-scaffold checkpoint (the cascade's refined structure).
+        emit_voxels(preview, preview_user, T2_STAGE_UPSAMPLE, 0, 0, hr_grid, hr_coords);
+
         // 1024-res conditioning (separate preprocess + encode at 1024)
         std::vector<unsigned char> rgb1024((size_t) 1024 * 1024 * 3);
         if (t2_preprocess_image_bytes(image_bytes, image_len, 1024, rgb1024.data(), perr, sizeof(perr))) {
@@ -591,6 +685,11 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         copy_err(err, err_len, "empty mesh (dual grid found no faces)");
         delete r; return nullptr;
     }
+    // Clean up the raw dual-grid soup: drop floating specks, then fill the small
+    // boundary holes extract() left. Both only edit triangles (no new vertices),
+    // so PBR voxel v == vertex v still holds for the texture stage.
+    fdg::drop_small_components(mesh);
+    fdg::fill_holes(mesh);
     r->verts   = std::move(mesh.verts);
     r->tris    = std::move(mesh.tris);
     r->normals = fdg::vertex_normals(fdg::Mesh{r->verts, r->tris});

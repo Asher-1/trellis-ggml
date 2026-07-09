@@ -14,9 +14,11 @@
 // learned split_weight = softplus(feat[6]) (reference eval-path tie-break).
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fdg {
@@ -122,26 +124,34 @@ inline Mesh extract(const float * feats, const int32_t * coords, int n,
     return m;
 }
 
-// Per-vertex shading normals, robust to the dual grid's unoriented winding.
+// Per-vertex shading normals for the dual grid's *unoriented*, heavily
+// non-manifold mesh.
 //
-// The reference flexible_dual_grid mesher emits every quad with a fixed vertex
-// order (edge_neighbor_voxel_offset) regardless of which way the surface crosses
-// the edge, so ~15-20% of faces are wound opposite to their neighbours. A plain
-// area-weighted vector sum (sum of signed face normals) therefore partially
-// cancels at those vertices, producing short, noisy normals and salt-and-pepper
-// shading. This is faithful to TRELLIS.2 (its mesh is unoriented too) but looks
-// grainy under one-sided lighting.
+// The reference mesher emits every quad with a fixed vertex order regardless of
+// which way the surface crosses the edge, so a large fraction of faces are wound
+// opposite to their neighbours. Two failure modes follow: (a) a naive
+// area-weighted normal cancels at those seams, and (b) any *sign* fix that leaves
+// stray flips is not harmless — the normal is interpolated across the triangle
+// *before* the fragment shader's abs(dot), so two adjacent vertices with opposite
+// normals make the interpolated normal cross zero mid-face → normalize() explodes
+// → speckled/blocky specular. The mesh is too non-manifold to 2-colour the
+// winding cleanly (edges shared by >2 faces frustrate it), so we don't try to.
 //
-// Instead accumulate the area-weighted *structure tensor* A = sum(area * n̂ n̂ᵀ).
-// Because n̂ n̂ᵀ == (−n̂)(−n̂)ᵀ it is immune to winding sign, so its dominant
-// eigenvector recovers the true surface-normal *direction* even where signed
-// normals cancel. We resolve the (arbitrary) sign to agree with the signed sum
-// for determinism; final shading is orientation-independent (see the viewer's
-// abs(dot) diffuse), so the sign only needs to be stable, not globally correct.
+//   1. Recover a smooth, winding-INDEPENDENT normal *direction* per vertex as the
+//      dominant eigenvector of the area-weighted structure tensor Σ area·n̂n̂ᵀ
+//      (immune to winding sign since n̂n̂ᵀ == (−n̂)(−n̂)ᵀ).
+//   2. Resolve the arbitrary per-vertex *sign* consistently with a parity
+//      union-find over mesh edges, so edge-adjacent vertices share a hemisphere
+//      and the interpolated normal stays clear of zero. Only genuinely frustrated
+//      (odd-cycle / non-manifold) edges are left flipped.
+// Final shading is orientation-independent (viewer uses abs(dot)), so only local
+// smoothness matters, not a globally correct outward sign. (Winding unification
+// and sign diffusion were both tried and are worse on this mesh: 2-colouring the
+// >2-face non-manifold edges frustrates more, and Jacobi diffusion checkerboards.)
 inline std::vector<float> vertex_normals(const Mesh & m) {
     const size_t nv = m.n_verts();
-    std::vector<double> A((size_t) nv * 6, 0.0);  // sym 3x3: xx,yy,zz,xy,xz,yz
-    std::vector<float>  sgn((size_t) nv * 3, 0.0f); // signed area-weighted sum (sign seed)
+    std::vector<double> A((size_t) nv * 6, 0.0);   // sym structure tensor per vertex
+    std::vector<float>  seed((size_t) nv * 3, 0.0f); // signed area sum: a sign hint
     for (size_t t = 0; t < m.tris.size(); t += 3) {
         const int i0 = m.tris[t], i1 = m.tris[t + 1], i2 = m.tris[t + 2];
         const float * a = &m.verts[(size_t) i0 * 3];
@@ -149,30 +159,27 @@ inline std::vector<float> vertex_normals(const Mesh & m) {
         const float * c = &m.verts[(size_t) i2 * 3];
         float e1[3], e2[3], fn[3];
         for (int k = 0; k < 3; ++k) { e1[k] = b[k]-a[k]; e2[k] = c[k]-a[k]; }
-        detail::cross(e1, e2, fn);   // |fn| == 2*area, direction == face normal
-        const double area = std::sqrt((double) fn[0]*fn[0] +
-                                      (double) fn[1]*fn[1] +
-                                      (double) fn[2]*fn[2]);
+        detail::cross(e1, e2, fn);
+        const double area = std::sqrt((double) fn[0]*fn[0] + (double) fn[1]*fn[1] + (double) fn[2]*fn[2]);
         if (area <= 1e-20) continue;
-        const double inv = 1.0 / area;                       // area * (fn/|fn|)(fn/|fn|)ᵀ
+        const double inv = 1.0 / area;
         const double xx = fn[0]*fn[0]*inv, yy = fn[1]*fn[1]*inv, zz = fn[2]*fn[2]*inv;
         const double xy = fn[0]*fn[1]*inv, xz = fn[0]*fn[2]*inv, yz = fn[1]*fn[2]*inv;
         for (int i : {i0, i1, i2}) {
             double * Av = &A[(size_t) i * 6];
             Av[0]+=xx; Av[1]+=yy; Av[2]+=zz; Av[3]+=xy; Av[4]+=xz; Av[5]+=yz;
-            float * sv = &sgn[(size_t) i * 3];
+            float * sv = &seed[(size_t) i * 3];
             sv[0]+=fn[0]; sv[1]+=fn[1]; sv[2]+=fn[2];
         }
     }
-    std::vector<float> nrm((size_t) nv * 3, 0.0f);
+    // (1) smooth, sign-ambiguous direction per vertex
+    std::vector<float> dir((size_t) nv * 3, 0.0f);
     for (size_t v = 0; v < nv; ++v) {
         const double * Av = &A[v * 6];
-        // dominant eigenvector of the symmetric structure tensor via power
-        // iteration, seeded from the signed sum (a good guess where it survives).
-        double x = sgn[v*3], y = sgn[v*3+1], z = sgn[v*3+2];
+        double x = seed[v*3], y = seed[v*3+1], z = seed[v*3+2];
         double l = std::sqrt(x*x + y*y + z*z);
         if (l < 1e-20) { x = Av[0]; y = Av[3]; z = Av[4]; l = std::sqrt(x*x+y*y+z*z); }
-        if (l < 1e-20) { nrm[v*3]=0.0f; nrm[v*3+1]=0.0f; nrm[v*3+2]=1.0f; continue; }
+        if (l < 1e-20) { dir[v*3+2] = 1.0f; continue; }
         x/=l; y/=l; z/=l;
         for (int it = 0; it < 8; ++it) {
             const double nx = Av[0]*x + Av[3]*y + Av[4]*z;
@@ -182,13 +189,157 @@ inline std::vector<float> vertex_normals(const Mesh & m) {
             if (nl < 1e-20) break;
             x = nx/nl; y = ny/nl; z = nz/nl;
         }
-        const float * sv = &sgn[v*3];
-        const double s = (x*sv[0] + y*sv[1] + z*sv[2]) < 0.0 ? -1.0 : 1.0;
-        nrm[v*3]   = (float) (s*x);
-        nrm[v*3+1] = (float) (s*y);
-        nrm[v*3+2] = (float) (s*z);
+        dir[v*3] = (float) x; dir[v*3+1] = (float) y; dir[v*3+2] = (float) z;
+    }
+    // (2) Resolve the arbitrary per-vertex sign *consistently* via a parity
+    //     union-find over mesh edges: two edge-adjacent vertices whose directions
+    //     are anti-aligned must end up with opposite signs (and vice versa), so
+    //     within each connected component neighbours share a hemisphere. Only
+    //     genuinely frustrated (odd-cycle / non-manifold) edges are left flipped.
+    std::vector<int>     ufp(nv), ufr(nv, 0);
+    std::vector<uint8_t> ufb(nv, 0);   // parity of a vertex relative to its parent
+    for (size_t i = 0; i < nv; ++i) ufp[i] = (int) i;
+    auto find = [&](int v, int & parity) {
+        int p = 0;
+        while (ufp[v] != v) { p ^= ufb[v]; v = ufp[v]; }
+        parity = p; return v;
+    };
+    auto join = [&](int a, int b) {
+        const float * na = &dir[(size_t) a * 3];
+        const float * nb = &dir[(size_t) b * 3];
+        const int rel = (na[0]*nb[0] + na[1]*nb[1] + na[2]*nb[2]) < 0.0f ? 1 : 0;
+        int pa, pb, ra = find(a, pa), rb = find(b, pb);
+        if (ra == rb) return;
+        if (ufr[ra] < ufr[rb]) { std::swap(ra, rb); std::swap(pa, pb); }
+        ufp[rb] = ra; ufb[rb] = (uint8_t) (pa ^ pb ^ rel);
+        if (ufr[ra] == ufr[rb]) ufr[ra]++;
+    };
+    for (size_t t = 0; t < m.tris.size(); t += 3) {
+        const int a = m.tris[t], b = m.tris[t+1], c = m.tris[t+2];
+        join(a, b); join(b, c); join(c, a);
+    }
+    // (3) pick each component's global sign toward the signed-sum seed (so the
+    //     result is deterministic and roughly outward), then emit oriented normals
+    std::unordered_map<int, double> comp_sign;
+    for (size_t v = 0; v < nv; ++v) {
+        int p, r = find((int) v, p);
+        const double s = p ? -1.0 : 1.0;
+        const float * sv = &seed[v*3];
+        comp_sign[r] += s * (dir[v*3]*sv[0] + dir[v*3+1]*sv[1] + dir[v*3+2]*sv[2]);
+    }
+    std::vector<float> nrm((size_t) nv * 3, 0.0f);
+    for (size_t v = 0; v < nv; ++v) {
+        int p, r = find((int) v, p);
+        double s = p ? -1.0 : 1.0;
+        if (comp_sign[r] < 0.0) s = -s;
+        nrm[v*3]   = (float) (s * dir[v*3]);
+        nrm[v*3+1] = (float) (s * dir[v*3+1]);
+        nrm[v*3+2] = (float) (s * dir[v*3+2]);
     }
     return nrm;
+}
+
+// Remove triangles that belong to tiny disconnected islands (the floating
+// specks that read as "blemishes"), keeping the vertex array and its indexing
+// intact so a parallel per-vertex attribute array (e.g. baked PBR) stays
+// aligned. Components are face groups connected through shared vertices; a
+// component is dropped when its face count is below min_frac of the total.
+inline void drop_small_components(Mesh & m, float min_frac = 0.0005f) {
+    const size_t nt = m.n_tris();
+    if (nt == 0) return;
+    const size_t nv = m.n_verts();
+    std::vector<int> p(nv);
+    for (size_t i = 0; i < nv; ++i) p[i] = (int) i;
+    auto find = [&](int x) { while (p[x] != x) { p[x] = p[p[x]]; x = p[x]; } return x; };
+    auto uni  = [&](int a, int b) { a = find(a); b = find(b); if (a != b) p[a] = b; };
+    for (size_t t = 0; t < m.tris.size(); t += 3) {
+        uni(m.tris[t], m.tris[t+1]); uni(m.tris[t+1], m.tris[t+2]);
+    }
+    std::unordered_map<int, int> faces;
+    for (size_t t = 0; t < m.tris.size(); t += 3) faces[find(m.tris[t])]++;
+    const int min_faces = std::max(1, (int) (min_frac * (double) nt));
+    std::vector<int> keep;
+    keep.reserve(m.tris.size());
+    for (size_t t = 0; t < m.tris.size(); t += 3) {
+        if (faces[find(m.tris[t])] >= min_faces) {
+            keep.push_back(m.tris[t]); keep.push_back(m.tris[t+1]); keep.push_back(m.tris[t+2]);
+        }
+    }
+    m.tris.swap(keep);
+}
+
+// Fill the small holes extract() leaves where a dual-grid quad was skipped (a
+// neighbour voxel was missing). A boundary edge is one used by exactly one
+// triangle; boundary edges chain into loops around each hole. Each loop up to
+// `max_loop` vertices is fan-triangulated from its first vertex. Only triangles
+// are added — no new vertices — so a parallel per-vertex attribute array (baked
+// PBR) stays aligned. Large loops (genuine openings) are left unfilled.
+inline void fill_holes(Mesh & m, int max_loop = 64, int max_passes = 4) {
+    if (m.n_tris() == 0) return;
+    auto key = [](int a, int b) {
+        const uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+        return ((uint64_t) lo << 32) | hi;
+    };
+    // Iterate: the greedy loop walk misses some loops at non-manifold junctions,
+    // and each fill can expose newly closeable loops, so repeat until a pass
+    // adds nothing (or the pass cap is hit).
+    for (int pass = 0; pass < max_passes; ++pass) {
+        const size_t before = m.tris.size();
+        // run-length count of undirected edges via sort (lighter than a hashmap)
+        std::vector<uint64_t> ek;
+        ek.reserve(m.tris.size());
+        for (size_t t = 0; t < m.tris.size(); t += 3) {
+            ek.push_back(key(m.tris[t],   m.tris[t+1]));
+            ek.push_back(key(m.tris[t+1], m.tris[t+2]));
+            ek.push_back(key(m.tris[t+2], m.tris[t]));
+        }
+        std::sort(ek.begin(), ek.end());
+        std::unordered_map<int, std::vector<int>> adj;   // boundary-vertex adjacency
+        for (size_t i = 0; i < ek.size(); ) {
+            size_t j = i + 1;
+            while (j < ek.size() && ek[j] == ek[i]) ++j;
+            if (j - i == 1) {   // used by exactly one triangle -> boundary edge
+                const int a = (int) (ek[i] >> 32), b = (int) (ek[i] & 0xffffffffu);
+                adj[a].push_back(b); adj[b].push_back(a);
+            }
+            i = j;
+        }
+        if (adj.empty()) break;
+
+        std::unordered_set<uint64_t> used;   // consumed boundary edges
+        for (const auto & kv : adj) {
+            const int start = kv.first;
+            for (const int nb0 : kv.second) {
+                if (used.count(key(start, nb0))) continue;
+                std::vector<int> loop{start};
+                int prev = start, cur = nb0;
+                used.insert(key(prev, cur));
+                bool closed = false;
+                while ((int) loop.size() <= max_loop) {
+                    loop.push_back(cur);
+                    if (cur == start) { closed = true; break; }
+                    int next = -1;
+                    auto it = adj.find(cur);
+                    if (it != adj.end())
+                        for (const int c : it->second)
+                            if (c != prev && !used.count(key(cur, c))) { next = c; break; }
+                    if (next < 0) break;            // open chain / dead end
+                    used.insert(key(cur, next));
+                    prev = cur; cur = next;
+                }
+                if (!closed) continue;
+                loop.pop_back();                    // drop the repeated start vertex
+                const int k = (int) loop.size();
+                if (k < 3 || k > max_loop) continue;
+                for (int t = 1; t < k - 1; ++t) {   // fan-triangulate from loop[0]
+                    m.tris.push_back(loop[0]);
+                    m.tris.push_back(loop[t]);
+                    m.tris.push_back(loop[t + 1]);
+                }
+            }
+        }
+        if (m.tris.size() == before) break;         // converged
+    }
 }
 
 } // namespace fdg

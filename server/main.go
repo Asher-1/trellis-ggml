@@ -7,10 +7,12 @@
 // API:
 //	GET  /                 self-contained WebGL viewer (embedded web/index.html)
 //	GET  /api/info         {backend, defaults}
-//	POST /api/generate     multipart image [+ seed, steps, guidance] -> {job}
-//	GET  /api/job/{id}     {state, stage, step, total, error, queue}
+//	POST /api/generate     multipart image [+ seed, steps, guidance, preview] -> {job}
+//	GET  /api/job/{id}     {state, stage, step, total, previewSeq, error}
 //	GET  /api/mesh/{id}    binary mesh: "T2MESH01" u32 nv u32 nt f32[3nv] verts
 //	                       f32[3nv] normals u32[3nt] tris (little-endian)
+//	GET  /api/preview/{id} latest live 3D preview: "T2VOX01" u32 res u32 nvox
+//	                       u16[3nvox] voxel coords (little-endian)
 package main
 
 import (
@@ -44,14 +46,23 @@ type job struct {
 	Total int    `json:"total"`
 	Error string `json:"error,omitempty"`
 
-	image    []byte
-	pipeline int
-	seed     uint64
-	steps    int
-	guidance float32
-	mesh     *meshData
-	glb      []byte // cached last GLB bake
-	glbKey   string // "tex-tris" the cached GLB was baked with
+	// Live intermediate 3D preview: PreviewSeq bumps whenever a fresh voxel blob
+	// lands (the browser watches it to know when to fetch /api/preview).
+	PreviewSeq   int    `json:"previewSeq"`
+	PreviewStage string `json:"previewStage,omitempty"`
+	PreviewStep  int    `json:"previewStep"`
+	PreviewTotal int    `json:"previewTotal"`
+
+	image       []byte
+	pipeline    int
+	seed        uint64
+	steps       int
+	guidance    float32
+	wantPreview bool
+	preview     []byte // latest preview blob (T2VOX01); served by /api/preview
+	mesh        *meshData
+	glb         []byte // cached last GLB bake
+	glbKey      string // "tex-tris" the cached GLB was baked with
 }
 
 type server struct {
@@ -67,6 +78,19 @@ func (s *server) worker() {
 		j.State = "running"
 		j.mu.Unlock()
 
+		var onPreview func(stage, step, total int, blob []byte)
+		if j.wantPreview {
+			onPreview = func(stage, step, total int, blob []byte) {
+				j.mu.Lock()
+				j.preview = blob
+				j.PreviewSeq++
+				j.PreviewStage = stageNames[stage]
+				j.PreviewStep = step
+				j.PreviewTotal = total
+				j.mu.Unlock()
+			}
+		}
+
 		mesh, err := s.eng.Generate(j.image, j.pipeline, j.seed, j.steps, j.guidance,
 			func(stage, step, total int) {
 				j.mu.Lock()
@@ -74,7 +98,8 @@ func (s *server) worker() {
 				j.Step = step
 				j.Total = total
 				j.mu.Unlock()
-			})
+			},
+			onPreview)
 
 		j.mu.Lock()
 		j.image = nil
@@ -123,13 +148,14 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	j := &job{
-		ID:       fmt.Sprintf("%08x", rand.Uint32()),
-		State:    "queued",
-		image:    img,
-		pipeline: pt,
-		seed:     formUint(r, "seed", rand.Uint64()%1_000_000),
-		steps:    int(formUint(r, "steps", 12)),
-		guidance: formFloat(r, "guidance", 7.5),
+		ID:          fmt.Sprintf("%08x", rand.Uint32()),
+		State:       "queued",
+		image:       img,
+		pipeline:    pt,
+		seed:        formUint(r, "seed", rand.Uint64()%1_000_000),
+		steps:       int(formUint(r, "steps", 12)),
+		guidance:    formFloat(r, "guidance", 7.5),
+		wantPreview: r.FormValue("preview") != "0", // live 3D previews unless opted out
 	}
 	if j.steps < 1 || j.steps > 50 {
 		j.steps = 12
@@ -207,6 +233,26 @@ func (s *server) handleMesh(w http.ResponseWriter, r *http.Request) {
 		binary.Write(w, binary.LittleEndian, mesh.PBR)
 	}
 	binary.Write(w, binary.LittleEndian, mesh.Tris)
+}
+
+// handlePreview streams the latest live intermediate-preview blob (a T2VOX01
+// voxel set) for a running job. The browser polls /api/job for previewSeq and
+// fetches this whenever it advances, swapping the voxels into the viewer.
+func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
+	j := s.getJob(r, "/api/preview/")
+	if j == nil {
+		http.Error(w, "no such job", http.StatusNotFound)
+		return
+	}
+	j.mu.Lock()
+	blob := j.preview
+	j.mu.Unlock()
+	if blob == nil {
+		http.Error(w, "no preview yet", http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(blob)
 }
 
 // handleGLB bakes the mesh into a UV-atlas-textured GLB on demand and streams
@@ -401,6 +447,7 @@ func main() {
 	mux.HandleFunc("/api/generate", s.handleGenerate)
 	mux.HandleFunc("/api/job/", s.handleJob)
 	mux.HandleFunc("/api/mesh/", s.handleMesh)
+	mux.HandleFunc("/api/preview/", s.handlePreview)
 	mux.HandleFunc("/api/glb/", s.handleGLB)
 
 	log.Printf("listening on %s", *addr)

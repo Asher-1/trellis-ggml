@@ -761,6 +761,8 @@ bool trellis2_ss_flow_sample(trellis2_ss_flow_model * m,
 
     const std::vector<float> zero_cond((size_t) cond_tokens * cond_channels, 0.0f);
     std::vector<float> pred_pos(n), pred_neg(n), pred_v(n), x0_pos(n), x0_cfg(n);
+    std::vector<float> x0_view;   // scratch for the live-preview x_0 estimate
+    if (P.preview) x0_view.resize(n);
 
     auto fwd = [&](double t, const float * c, std::vector<float> & dst) -> bool {
         return trellis2_ss_flow_forward(m, x_t.data(), (float) (1000.0 * t),
@@ -794,6 +796,13 @@ bool trellis2_ss_flow_sample(trellis2_ss_flow_model * m,
                 }
                 xstart_to_pred(x_t, t, sm, x0_cfg, pred_v);
             }
+        }
+
+        // Live preview: the denoised x_0 estimate at this step (best guess of the
+        // clean latent), computed from x_t@t before the Euler step overwrites it.
+        if (P.preview) {
+            pred_to_xstart(x_t, t, sm, pred_v, x0_view);
+            P.preview(P.preview_user, i + 1, P.steps, x0_view.data(), (int) n);
         }
 
         // Euler step: x_{t-1} = x_t - (t - t_prev) * v

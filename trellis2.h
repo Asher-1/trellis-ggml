@@ -181,6 +181,14 @@ struct trellis2_ss_sampler_params {
     // Optional per-step progress callback (called after each Euler step).
     void   (*progress)(void * user, int step, int total) = nullptr;
     void   * progress_user         = nullptr;
+
+    // Optional per-step preview callback: receives the denoised x_0 estimate
+    // (the current best-guess clean latent, [in_channels * resolution^3]) after
+    // each step, so a host can decode it into a live intermediate 3D preview.
+    // `latent` is valid only during the call. Runs on the sampling thread — the
+    // callee must return promptly (it blocks the next step).
+    void   (*preview)(void * user, int step, int total, const float * latent, int n) = nullptr;
+    void   * preview_user          = nullptr;
 };
 
 // Run one forward pass of the SS-flow DiT (CPU backend), i.e. the velocity

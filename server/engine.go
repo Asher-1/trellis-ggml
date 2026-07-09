@@ -12,7 +12,7 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-const abiVersion = 4
+const abiVersion = 5
 
 // Progress stages (enum t2_stage).
 const (
@@ -69,6 +69,7 @@ type engine struct {
 	pipelineCaps    func(p uintptr) int32
 	generate        func(p uintptr, img unsafe.Pointer, imgLen int32, pipelineType int32, seed uint64,
 		steps int32, guidance float32, cb uintptr, user unsafe.Pointer,
+		preview uintptr, previewUser unsafe.Pointer,
 		err unsafe.Pointer, errLen int32) uintptr
 	meshNVerts   func(r uintptr) int32
 	meshNTris    func(r uintptr) int32
@@ -89,9 +90,13 @@ type engine struct {
 var (
 	progressMu   sync.Mutex
 	progressSink func(stage, step, total int)
+	previewSink  func(stage, step, total int, blob []byte)
 )
 
-var progressCallback uintptr // created once; purego callbacks are permanent
+var (
+	progressCallback uintptr // created once; purego callbacks are permanent
+	previewCallback  uintptr
+)
 
 // slatGGUF/shapeDecGGUF may be "" for the coarse path; slatHRGGUF may be "" to
 // disable the 1024 cascade (512 fine only).
@@ -134,6 +139,22 @@ func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shape
 			return 0
 		})
 	}
+	if previewCallback == 0 {
+		// Live intermediate-preview blobs (T2VOX01 voxel sets). `data` is only
+		// valid during the call, so copy before handing it to the sink.
+		previewCallback = purego.NewCallback(func(user unsafe.Pointer, stage, step, total int32,
+			data unsafe.Pointer, length int32) uintptr {
+			progressMu.Lock()
+			sink := previewSink
+			progressMu.Unlock()
+			if sink != nil && data != nil && length > 0 {
+				blob := make([]byte, int(length))
+				copy(blob, unsafe.Slice((*byte)(data), int(length)))
+				sink(int(stage), int(step), int(total), blob)
+			}
+			return 0
+		})
+	}
 
 	errBuf := make([]byte, 512)
 	p := e.pipelineLoad(dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shapeDecGGUF,
@@ -158,19 +179,24 @@ type meshData struct {
 	PBR     []float32 // 5 * NVerts (base_color rgb, metallic, roughness); nil if untextured
 }
 
-// Generate runs the full image->mesh pipeline. onProgress may be nil.
+// Generate runs the full image->mesh pipeline. onProgress and onPreview may be
+// nil. onPreview receives live intermediate 3D preview blobs (T2VOX01 voxel
+// sets) as the sparse structure emerges.
 func (e *engine) Generate(image []byte, pipelineType int, seed uint64, steps int, guidance float32,
-	onProgress func(stage, step, total int)) (*meshData, error) {
+	onProgress func(stage, step, total int),
+	onPreview func(stage, step, total int, blob []byte)) (*meshData, error) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	progressMu.Lock()
 	progressSink = onProgress
+	previewSink = onPreview
 	progressMu.Unlock()
 	defer func() {
 		progressMu.Lock()
 		progressSink = nil
+		previewSink = nil
 		progressMu.Unlock()
 	}()
 
@@ -178,10 +204,14 @@ func (e *engine) Generate(image []byte, pipelineType int, seed uint64, steps int
 	if onProgress != nil {
 		cb = progressCallback
 	}
+	pv := uintptr(0)
+	if onPreview != nil {
+		pv = previewCallback
+	}
 
 	errBuf := make([]byte, 512)
 	r := e.generate(e.pipeline, unsafe.Pointer(&image[0]), int32(len(image)), int32(pipelineType),
-		seed, int32(steps), guidance, cb, nil,
+		seed, int32(steps), guidance, cb, nil, pv, nil,
 		unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
 	if r == 0 {
 		return nil, fmt.Errorf("%s", cstr(errBuf))

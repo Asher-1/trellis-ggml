@@ -26,7 +26,7 @@
 extern "C" {
 #endif
 
-#define T2_CAPI_ABI_VERSION 4
+#define T2_CAPI_ABI_VERSION 5
 
 TRELLIS2_CAPI int t2_abi_version(void);
 
@@ -69,6 +69,15 @@ enum t2_load_flags {
 ** entry. Called from the generating thread. */
 typedef void (*t2_progress_fn)(void * user, int stage, int step, int total);
 
+/* Optional live intermediate-preview callback. During generation the host
+** receives self-describing geometry blobs (currently "T2VOX01": a voxel set —
+** magic[8], u32 res, u32 nvox, u16[3*nvox] coords in [0,res)) for the current
+** stage, so a viewer can show the shape emerging in 3D. `data` is valid only
+** during the call (copy it). Fires on the generating thread. NULL disables it.
+** See t2_generate. */
+typedef void (*t2_preview_fn)(void * user, int stage, int step, int total,
+                              const void * data, int len);
+
 typedef struct t2_pipeline    t2_pipeline;
 typedef struct t2_mesh_result t2_mesh_result;
 
@@ -104,12 +113,16 @@ TRELLIS2_CAPI const char *  t2_pipeline_backend(t2_pipeline * p);
 /* image bytes (PNG/JPEG/...; anything stb_image decodes) -> triangle mesh.
 ** pipeline_type is a t2_pipeline_type (T2_PIPE_AUTO picks the best available).
 ** steps <= 0 and guidance < 0 select the pipeline defaults (12 / 7.5).
+** `preview` (may be NULL) streams live intermediate 3D previews as the sparse
+** structure emerges; `preview_user` is passed back to it. The T2_PREVIEW_STRIDE
+** env var (default: ~4 previews across the SS steps) tunes the per-step cadence.
 ** NOT thread-safe per pipeline: serialize calls on one t2_pipeline. */
 TRELLIS2_CAPI t2_mesh_result * t2_generate(t2_pipeline * p,
                                            const void * image_bytes, int image_len,
                                            int pipeline_type,
                                            uint64_t seed, int steps, float guidance,
                                            t2_progress_fn progress, void * user,
+                                           t2_preview_fn preview, void * preview_user,
                                            char * err, int err_len);
 
 /* Mesh accessors. Vertices are in a centered unit cube ([-0.5, 0.5]^3, same
