@@ -153,6 +153,88 @@ void emit_voxels(t2_preview_fn fn, void * user, int stage, int step, int total,
     fn(user, stage, step, total, blob.data(), (int) blob.size());
 }
 
+// ── intermediate shape-SLAT mesh keyframes (opt-in) ──────────────────────────
+//
+// A keyframe is a coarse marching-cubes mesh (T2MESH01 blob, same layout as the
+// final /api/mesh) of an intermediate shape-flow x_0 estimate — so the surface
+// can be watched forming during the otherwise-invisible SLAT stage. Decoding
+// mid-flow would OOM the 16 GB budget (the flow DiT is resident and can't be
+// freed while its sampler is running), so we CAPTURE the cheap latents during
+// the flow and REPLAY them into meshes AFTER the final decode, when the flow
+// DiTs are freed and the shape decoder owns VRAM.
+
+// Pack an MC mesh into a T2MESH01 blob: magic[8] u32 nv u32 nt
+//   f32[3nv] verts  f32[3nv] normals  i32[3nt] tris  (little-endian).
+void pack_mesh(const mc::Mesh & m, std::vector<uint8_t> & blob) {
+    const uint32_t nv = (uint32_t) (m.verts.size() / 3);
+    const uint32_t nt = (uint32_t) (m.tris.size()  / 3);
+    blob.resize(16 + (size_t) nv * 24 + (size_t) nt * 12);
+    std::memcpy(blob.data(), "T2MESH01", 8);
+    std::memcpy(blob.data() + 8,  &nv, 4);
+    std::memcpy(blob.data() + 12, &nt, 4);
+    size_t o = 16;
+    std::memcpy(blob.data() + o, m.verts.data(),   (size_t) nv * 12); o += (size_t) nv * 12;
+    std::memcpy(blob.data() + o, m.normals.data(), (size_t) nv * 12); o += (size_t) nv * 12;
+    std::memcpy(blob.data() + o, m.tris.data(),    (size_t) nt * 12);
+}
+
+// One shape-flow stage's captured intermediate x_0 latents (denormalized) plus
+// the scaffold they sit on, awaiting post-decode replay.
+struct kf_capture {
+    int stage    = 0;   // T2_STAGE_SLAT_FLOW or T2_STAGE_SLAT_FLOW_HR
+    int res_in   = 0;   // scaffold resolution (32 LR / 64 HR)
+    int levels   = 0;   // upsample levels to the ~128^3 keyframe grid
+    int stride   = 1;   // capture every `stride` steps (plus the last)
+    int channels = 0;   // latent channels (32)
+    const float * norm_mean = nullptr;
+    const float * norm_std  = nullptr;
+    std::vector<int32_t> coords;                // scaffold coords, copied once
+    std::vector<int> steps, totals;             // per capture, for labelling
+    std::vector<std::vector<float>> latents;    // denormalized [L*channels] each
+};
+
+// Sampler preview trampoline: denormalize + stash the step's x_0 estimate.
+void kf_capture_cb(void * u, int step, int total, const float * latent, int n) {
+    auto * c = (kf_capture *) u;
+    if (c->stride < 1) return;
+    if (step != total && (step % c->stride) != 0) return;   // stride, plus the last step
+    const int C = c->channels;
+    std::vector<float> den((size_t) n);
+    for (int i = 0; i < n; ++i) den[i] = latent[i] * c->norm_std[i % C] + c->norm_mean[i % C];
+    c->steps.push_back(step);
+    c->totals.push_back(total);
+    c->latents.push_back(std::move(den));
+}
+
+// Replay captured latents into coarse MC-mesh keyframes and stream each. Runs
+// after the final decode (decoder owns VRAM). Best-effort: skips on any failure.
+void emit_keyframes(trellis2_shape_dec_model * dec, kf_capture & kf,
+                    t2_preview_fn fn, void * user) {
+    if (!fn || kf.latents.empty() || !dec) return;
+    const int L   = (int) (kf.coords.size() / 3);
+    const int tgt = kf.res_in << kf.levels;     // keyframe grid (128^3)
+    for (size_t k = 0; k < kf.latents.size(); ++k) {
+        std::vector<int32_t> up;
+        std::string e;
+        if (!trellis2_shape_dec_upsample(dec, kf.latents[k].data(), L, kf.coords.data(),
+                                         kf.levels, up, &e))
+            continue;
+        std::vector<float> field((size_t) tgt * tgt * tgt, 0.0f);
+        for (size_t i = 0; i + 2 < up.size(); i += 3) {
+            const int x = up[i], y = up[i + 1], z = up[i + 2];
+            if (x >= 0 && x < tgt && y >= 0 && y < tgt && z >= 0 && z < tgt)
+                field[((size_t) x * tgt + y) * tgt + z] = 1.0f;
+        }
+        mc::Mesh m = mc::extract(field.data(), tgt, tgt, tgt, 0.5f);
+        if (m.verts.empty()) continue;
+        const float inv = 1.0f / (float) tgt;
+        for (auto & v : m.verts) v = v * inv - 0.5f;   // -> centered unit cube
+        std::vector<uint8_t> blob;
+        pack_mesh(m, blob);
+        fn(user, kf.stage, kf.steps[k], kf.totals[k], blob.data(), (int) blob.size());
+    }
+}
+
 // Per-step SS preview cadence: T2_PREVIEW_STRIDE if set, else ~4 across the run.
 int preview_stride(int steps) {
     if (const char * e = std::getenv("T2_PREVIEW_STRIDE")) {
@@ -446,6 +528,15 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
     if (pt == T2_PIPE_1024 && !p->cascade) pt = p->fine ? T2_PIPE_512 : T2_PIPE_COARSE;
     if (pt == T2_PIPE_512  && !p->fine)    pt = T2_PIPE_COARSE;
 
+    // Intermediate shape-SLAT keyframes (opt-in via T2_KEYFRAMES = per-stage
+    // count): capture a few x_0 estimates during the shape flow and replay them
+    // as coarse meshes after the final decode. Only when the host takes previews.
+    int keyframes = 0;
+    if (preview) {
+        if (const char * kv = std::getenv("T2_KEYFRAMES")) keyframes = std::atoi(kv);
+        keyframes = keyframes < 0 ? 0 : (keyframes > 8 ? 8 : keyframes);
+    }
+
     const int S = 512;
 
     if (progress) progress(user, T2_STAGE_PREPROCESS, 0, 0);
@@ -588,10 +679,20 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         return slp;
     };
 
+    kf_capture kf_lr, kf_hr;   // intermediate shape-flow keyframes (opt-in)
+
     // ── LR shape-SLAT flow (512 model, 512-res cond) ─────────────────────────
     std::vector<float> slat((size_t) L * shp.in_channels);
     {
         trellis2_ss_sampler_params slp = make_slp(T2_STAGE_SLAT_FLOW, seed ^ 0x51a7ULL);
+        if (keyframes > 0) {
+            kf_lr.stage = T2_STAGE_SLAT_FLOW; kf_lr.res_in = ss_res; kf_lr.channels = shp.in_channels;
+            kf_lr.norm_mean = shp.norm_mean; kf_lr.norm_std = shp.norm_std; kf_lr.coords = coords;
+            while ((ss_res << (kf_lr.levels + 1)) <= 128) kf_lr.levels++;   // -> 128^3
+            if (kf_lr.levels < 1) kf_lr.levels = 1;
+            kf_lr.stride = std::max(1, slp.steps / keyframes);
+            slp.preview = kf_capture_cb; slp.preview_user = &kf_lr;
+        }
         if (!trellis2_slat_flow_sample(p->slat, L, coords.data(),
                                        cond.data.data(), (int) cond.tokens(), (int) cond.channels(),
                                        &slp, nullptr, /*denormalize*/ true, slat.data(), &e)) {
@@ -660,6 +761,14 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         const trellis2_slat_flow_hparams & shp_hr = trellis2_slat_flow_hparams_of(p->slat_hr);
         std::vector<float> hr_slat((size_t) Lhr * shp_hr.in_channels);
         trellis2_ss_sampler_params slp = make_slp(T2_STAGE_SLAT_FLOW_HR, seed ^ 0x1024ULL);
+        if (keyframes > 0) {
+            kf_hr.stage = T2_STAGE_SLAT_FLOW_HR; kf_hr.res_in = hr_grid; kf_hr.channels = shp_hr.in_channels;
+            kf_hr.norm_mean = shp_hr.norm_mean; kf_hr.norm_std = shp_hr.norm_std; kf_hr.coords = hr_coords;
+            while ((hr_grid << (kf_hr.levels + 1)) <= 128) kf_hr.levels++;   // -> 128^3
+            if (kf_hr.levels < 1) kf_hr.levels = 1;
+            kf_hr.stride = std::max(1, slp.steps / keyframes);
+            slp.preview = kf_capture_cb; slp.preview_user = &kf_hr;
+        }
         if (!trellis2_slat_flow_sample(p->slat_hr, Lhr, hr_coords.data(),
                                        cond1024.data.data(), (int) cond1024.tokens(), (int) cond1024.channels(),
                                        &slp, nullptr, /*denormalize*/ true, hr_slat.data(), &e)) {
@@ -693,6 +802,14 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
     r->verts   = std::move(mesh.verts);
     r->tris    = std::move(mesh.tris);
     r->normals = fdg::vertex_normals(fdg::Mesh{r->verts, r->tris});
+
+    // ── shape-flow keyframe replay ───────────────────────────────────────────
+    // Now is the safe window: the flow DiTs are freed (ensure_decode_vram) and
+    // the shape decoder owns VRAM, before the texture stage loads its models.
+    if (preview && keyframes > 0) {
+        emit_keyframes(p->shapedec, kf_lr, preview, preview_user);
+        emit_keyframes(p->shapedec, kf_hr, preview, preview_user);   // empty for 512
+    }
 
     // ── PBR texture stage (optional) ─────────────────────────────────────────
     if (p->texture && pt != T2_PIPE_COARSE) {

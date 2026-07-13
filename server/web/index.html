@@ -57,6 +57,22 @@
     position: absolute; bottom: 10px; left: 12px; color: var(--dim);
     font-size: 12px; pointer-events: none;
   }
+  #timeline {
+    position: absolute; left: 12px; right: 12px; bottom: 10px;
+    display: none; align-items: center; gap: 10px;
+    background: rgba(16,20,24,.72); border: 1px solid var(--edge);
+    border-radius: 8px; padding: 7px 12px; backdrop-filter: blur(4px);
+  }
+  #timeline input[type=range] { flex: 1; accent-color: var(--accent); min-width: 0; }
+  #tlplay {
+    background: var(--bg); color: var(--text); border: 1px solid var(--edge);
+    border-radius: 6px; width: 30px; height: 26px; cursor: pointer; flex: none;
+  }
+  #tllabel {
+    font-size: 12px; color: var(--dim); flex: none;
+    min-width: 132px; text-align: right; white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
   .toggles { display: flex; gap: 8px; }
   .toggles button {
     flex: 1; background: var(--bg); color: var(--dim);
@@ -120,6 +136,7 @@
       <button id="twire">wireframe</button>
       <button id="tspin" class="on">auto-rotate</button>
       <button id="tsteps" class="on" title="watch the shape emerge in 3D during generation">live steps</button>
+      <button id="tkf" title="also record coarse mesh keyframes of the shape stage forming (slower)">keyframes</button>
       <button id="dglb" style="display:none">download GLB</button>
     </div>
     <div id="histwrap" style="display:none">
@@ -129,13 +146,21 @@
       </div>
       <div id="hist"></div>
     </div>
-    <footer><em>live steps</em> shows each stage in 3D as it computes: the
-    sparse structure emerges as 64&sup3; voxels, then the final dual-grid mesh
-    is extracted. Turn it off for the fastest run.</footer>
+    <footer><em>live steps</em> records each stage in 3D as it computes — the
+    sparse structure emerging as 64&sup3; voxels, then the final dual-grid mesh —
+    and a scrubber lets you replay the whole generation. <em>keyframes</em> adds
+    coarse meshes of the shape stage forming (a few extra decodes, slower). Turn
+    <em>live steps</em> off for the fastest run.</footer>
   </div>
   <div id="view">
     <canvas id="gl"></canvas>
     <div id="hint">drag: rotate (trackball) &middot; wheel: zoom &middot; right-drag / shift-drag: pan &middot; double-click: reset view</div>
+    <div id="timeline">
+      <button id="tlplay" title="play the generation back">&#9654;</button>
+      <input id="tlrange" type="range" min="0" max="0" value="0" step="1"
+             title="scrub through the recorded generation stages">
+      <span id="tllabel"></span>
+    </div>
   </div>
 </main>
 <script>
@@ -146,9 +171,14 @@ const $ = id => document.getElementById(id);
 let imageBlob = null;
 let stepsOn = true;   // stream live 3D previews of the intermediate stages
 
+let kfOn = false;     // also record coarse mesh keyframes during the shape stage (opt-in, slower)
 $("tsteps").addEventListener("click", () => {
   stepsOn = !stepsOn;
   $("tsteps").classList.toggle("on", stepsOn);
+});
+$("tkf").addEventListener("click", () => {
+  kfOn = !kfOn;
+  $("tkf").classList.toggle("on", kfOn);
 });
 
 const QUALITY_LABELS = {
@@ -228,12 +258,14 @@ $("go").addEventListener("click", async () => {
   fd.append("steps", $("steps").value);
   fd.append("guidance", $("guidance").value);
   fd.append("preview", stepsOn ? "1" : "0");
+  fd.append("keyframes", (stepsOn && kfOn) ? "3" : "0");
 
   // snapshot the input thumbnail + quality now, to file under history on success
   const genQuality = $("quality").value;
   const genThumb = await makeThumb(imageBlob);
 
   viewer.clear();   // blank any prior mesh; previews/mesh will populate the view
+  resetTimeline();  // start a fresh recording for this run
 
   try {
     const r = await fetch("/api/generate", { method: "POST", body: fd });
@@ -255,7 +287,6 @@ async function poll(id, thumb, quality) {
                       "upsampling scaffold": 42,
                       "sampling shape SLAT (1024)": 46, "decoding shape (1024)": 88,
                       "extracting mesh": 95 };
-  let lastPreviewSeq = -1;
   for (;;) {
     const r = await fetch("/api/job/" + id);
     if (!r.ok) throw new Error(await r.text());
@@ -283,38 +314,39 @@ async function poll(id, thumb, quality) {
     } else {
       setStatus("queued…");
     }
-    // Live intermediate 3D preview: swap in the latest voxel snapshot.
-    if (stepsOn && j.previewSeq && j.previewSeq !== lastPreviewSeq) {
-      lastPreviewSeq = j.previewSeq;
-      await loadPreview(id);
+    // Record every new intermediate frame (the server keeps them all), showing
+    // the newest live. After the run these frames replay through the scrubber.
+    if (stepsOn && j.previewSeq > haveFrames) {
+      const fm = j.frames || [];
+      while (haveFrames < j.previewSeq) {
+        await recordFrame(id, haveFrames, fm);
+        haveFrames++;
+      }
     }
     await new Promise(res => setTimeout(res, 500));
   }
 }
 
-// Fetch + display the latest intermediate preview (a T2VOX01 voxel set).
-// Best-effort: a failed/racy fetch just skips a frame.
-async function loadPreview(id) {
-  try {
-    const r = await fetch("/api/preview/" + id);
-    if (!r.ok) return;
-    const buf = await r.arrayBuffer();
-    const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 7));
-    if (magic !== "T2VOX01") return;
-    const dv = new DataView(buf);
-    const res = dv.getUint32(8, true), nvox = dv.getUint32(12, true);
-    const coords = new Uint16Array(buf, 16, nvox * 3);
-    viewer.setVoxels(res, coords);
-  } catch (e) { /* previews are best-effort */ }
+/* ── recorded stage playback (scrubber) ─────────────────────────────────────
+ * The server records every intermediate preview (voxel frames as the sparse
+ * structure condenses, plus any decoded mesh keyframes). We fetch each by index
+ * and keep it, so a finished generation can be scrubbed / played back through
+ * its stages. The final mesh is appended as the last frame. */
+let recordedFrames = [];   // {kind:'voxel',res,coords,meta} | {kind:'mesh',verts,normals,tris,pbr,meta}
+let haveFrames = 0;        // preview seqs fetched so far this run
+let tlTimer = 0;           // setInterval handle while playing back
+
+function resetTimeline() {
+  recordedFrames = []; haveFrames = 0;
+  stopPlayback();
+  $("timeline").style.display = "none";
+  $("hint").style.display = "";
 }
 
-async function loadMesh(id) {
-  const r = await fetch("/api/mesh/" + id);
-  if (!r.ok) throw new Error(await r.text());
-  const buf = await r.arrayBuffer();
+// Parse a T2MESH0* blob into typed arrays (shared by keyframes + the final mesh).
+function parseMesh(buf) {
   const dv = new DataView(buf);
   const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 8));
-  if (magic !== "T2MESH01" && magic !== "T2MESH02") throw new Error("bad mesh magic");
   const textured = magic === "T2MESH02";
   const nv = dv.getUint32(8, true), nt = dv.getUint32(12, true);
   let off = 16;
@@ -323,9 +355,105 @@ async function loadMesh(id) {
   let pbr = null;
   if (textured) { pbr = new Float32Array(buf, off, nv * 5); off += nv * 20; }
   const tris = new Int32Array(buf, off, nt * 3);
-  $("meshinfo").textContent = `${nv.toLocaleString()} vertices · ${nt.toLocaleString()} triangles`
-    + (textured ? " · PBR" : "");
-  viewer.setMesh(verts, normals, tris, pbr);
+  return { verts, normals, tris, pbr, nv, nt, textured };
+}
+
+// Fetch recorded frame `seq`, append it, and show it live. Best-effort.
+async function recordFrame(id, seq, framesMeta) {
+  try {
+    const r = await fetch(`/api/preview/${id}?seq=${seq}`);
+    if (!r.ok) return;
+    const buf = await r.arrayBuffer();
+    const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 6));
+    const meta = framesMeta && framesMeta[seq];
+    if (magic === "T2VOX0") {
+      const dv = new DataView(buf);
+      const res = dv.getUint32(8, true), nvox = dv.getUint32(12, true);
+      const coords = new Uint16Array(buf, 16, nvox * 3);
+      recordedFrames.push({ kind: "voxel", res, coords, meta });
+    } else if (magic === "T2MESH") {
+      const m = parseMesh(buf);
+      recordedFrames.push({ kind: "mesh", verts: m.verts, normals: m.normals,
+                            tris: m.tris, pbr: m.pbr, meta });
+    } else return;
+    renderFrame(recordedFrames.length - 1);   // show it as it arrives
+  } catch (e) { /* previews are best-effort */ }
+}
+
+// Show a recorded frame in the viewer (camera untouched) and sync the scrubber.
+function renderFrame(i) {
+  const f = recordedFrames[i];
+  if (!f) return;
+  if (f.kind === "voxel") viewer.setVoxels(f.res, f.coords);
+  else viewer.setMesh(f.verts, f.normals, f.tris, f.pbr);
+  const rng = $("tlrange");
+  if (+rng.value !== i) rng.value = i;
+  const m = f.meta || {};
+  let s = m.stage || (f.kind === "mesh" ? "mesh" : "voxels");
+  if (m.total) s += ` ${m.step}/${m.total}`;
+  $("tllabel").textContent = `${i + 1}/${recordedFrames.length} · ${s}`;
+}
+
+// Canonical stage order so the scrubber plays chronologically regardless of the
+// order frames arrive (mesh keyframes are emitted late, after the final decode).
+const STAGE_RANK = {
+  "preprocess": 0, "encoding image (DINOv3)": 1, "sampling sparse structure": 2,
+  "decoding occupancy": 3, "sampling shape SLAT": 4, "upsampling scaffold": 5,
+  "sampling shape SLAT (1024)": 6, "decoding shape": 7, "decoding shape (1024)": 7,
+  "extracting mesh": 8, "final mesh": 99,
+};
+function frameRank(f) {
+  const m = f.meta || {};
+  return (STAGE_RANK[m.stage] ?? 50) * 1000 + (m.step || 0);
+}
+
+// Reveal the scrubber once a run has more than one recorded frame.
+function buildTimeline() {
+  const n = recordedFrames.length;
+  if (n <= 1) return;
+  recordedFrames.sort((a, b) => frameRank(a) - frameRank(b));   // chronological
+  const rng = $("tlrange");
+  rng.max = n - 1; rng.value = n - 1;
+  $("timeline").style.display = "flex";
+  $("hint").style.display = "none";
+  renderFrame(n - 1);
+}
+
+function stopPlayback() {
+  if (tlTimer) { clearInterval(tlTimer); tlTimer = 0; $("tlplay").innerHTML = "&#9654;"; }
+}
+
+$("tlplay").addEventListener("click", () => {
+  if (tlTimer) { stopPlayback(); return; }
+  if (recordedFrames.length < 2) return;
+  let i = +$("tlrange").value;
+  if (i >= recordedFrames.length - 1) i = -1;   // replay from the start
+  $("tlplay").innerHTML = "&#10073;&#10073;";   // pause glyph
+  tlTimer = setInterval(() => {
+    if (++i >= recordedFrames.length) { stopPlayback(); return; }
+    renderFrame(i);
+  }, 220);
+});
+
+$("tlrange").addEventListener("input", () => {
+  stopPlayback();
+  renderFrame(+$("tlrange").value);
+});
+
+async function loadMesh(id) {
+  const r = await fetch("/api/mesh/" + id);
+  if (!r.ok) throw new Error(await r.text());
+  const buf = await r.arrayBuffer();
+  const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 8));
+  if (magic !== "T2MESH01" && magic !== "T2MESH02") throw new Error("bad mesh magic");
+  const m = parseMesh(buf);
+  $("meshinfo").textContent = `${m.nv.toLocaleString()} vertices · ${m.nt.toLocaleString()} triangles`
+    + (m.textured ? " · PBR" : "");
+  viewer.setMesh(m.verts, m.normals, m.tris, m.pbr);
+  // Append the finished mesh as the final frame of the scrub timeline.
+  recordedFrames.push({ kind: "mesh", verts: m.verts, normals: m.normals,
+                        tris: m.tris, pbr: m.pbr, meta: { stage: "final mesh" } });
+  buildTimeline();
   glbJobId = id;
   $("dglb").style.display = "";
   $("dglb").disabled = false;
@@ -415,10 +543,21 @@ function removeHistory(id) {
   saveHistory(); renderHistory();
 }
 
-// Re-view a past generation (its mesh still lives on the server).
+// Re-view a past generation (its mesh still lives on the server). If the server
+// still holds its recorded stage frames, replay is scrubbable too.
 async function viewGeneration(id) {
   setStatus("loading…");
   try {
+    resetTimeline();
+    try {
+      const jr = await fetch("/api/job/" + id);
+      if (jr.ok) {
+        const jj = await jr.json();
+        const fm = jj.frames || [];
+        for (let k = 0; k < (jj.previewSeq || 0); k++) await recordFrame(id, k, fm);
+        haveFrames = jj.previewSeq || 0;
+      }
+    } catch (e) { /* no recorded frames; mesh-only replay */ }
     await loadMesh(id);
     activeGen = id; renderHistory();
     setStatus("done");

@@ -36,6 +36,16 @@ import (
 var webFS embed.FS
 
 const maxUpload = 32 << 20 // 32 MiB
+const maxFrames = 256      // cap recorded preview frames per job (bounds memory)
+
+// frameMeta describes one recorded intermediate-preview frame so the viewer can
+// label and order the scrubber. Kind is "voxel" (T2VOX01) or "mesh" (T2MESH0*).
+type frameMeta struct {
+	Stage string `json:"stage"`
+	Step  int    `json:"step"`
+	Total int    `json:"total"`
+	Kind  string `json:"kind"`
+}
 
 type job struct {
 	mu    sync.Mutex
@@ -46,12 +56,16 @@ type job struct {
 	Total int    `json:"total"`
 	Error string `json:"error,omitempty"`
 
-	// Live intermediate 3D preview: PreviewSeq bumps whenever a fresh voxel blob
-	// lands (the browser watches it to know when to fetch /api/preview).
-	PreviewSeq   int    `json:"previewSeq"`
-	PreviewStage string `json:"previewStage,omitempty"`
-	PreviewStep  int    `json:"previewStep"`
-	PreviewTotal int    `json:"previewTotal"`
+	// Recorded intermediate 3D previews: every frame is kept (not just the
+	// latest) so the viewer can scrub the whole generation back and forth.
+	// PreviewSeq == number of frames recorded; the browser fetches any frame it
+	// is still missing by index (/api/preview/{id}?seq=N). Frames carries the
+	// per-frame stage/step/kind metadata for labelling the scrubber.
+	PreviewSeq   int         `json:"previewSeq"`
+	PreviewStage string      `json:"previewStage,omitempty"`
+	PreviewStep  int         `json:"previewStep"`
+	PreviewTotal int         `json:"previewTotal"`
+	Frames       []frameMeta `json:"frames,omitempty"`
 
 	image       []byte
 	pipeline    int
@@ -59,7 +73,8 @@ type job struct {
 	steps       int
 	guidance    float32
 	wantPreview bool
-	preview     []byte // latest preview blob (T2VOX01); served by /api/preview
+	keyframes   int      // intermediate shape-SLAT mesh keyframes to record (0 = off)
+	previews    [][]byte // every preview blob, in order; served by /api/preview?seq=
 	mesh        *meshData
 	glb         []byte // cached last GLB bake
 	glbKey      string // "tex-tris" the cached GLB was baked with
@@ -78,12 +93,25 @@ func (s *server) worker() {
 		j.State = "running"
 		j.mu.Unlock()
 
+		// The library reads T2_KEYFRAMES for opt-in intermediate mesh keyframes.
+		// A single worker goroutine runs generations serially, so setting the env
+		// per-job here is race-free.
+		os.Setenv("T2_KEYFRAMES", strconv.Itoa(j.keyframes))
+
 		var onPreview func(stage, step, total int, blob []byte)
 		if j.wantPreview {
 			onPreview = func(stage, step, total int, blob []byte) {
 				j.mu.Lock()
-				j.preview = blob
-				j.PreviewSeq++
+				if len(j.previews) < maxFrames {
+					kind := "voxel"
+					if len(blob) >= 6 && string(blob[:6]) == "T2MESH" {
+						kind = "mesh"
+					}
+					j.previews = append(j.previews, blob)
+					j.Frames = append(j.Frames, frameMeta{
+						Stage: stageNames[stage], Step: step, Total: total, Kind: kind})
+					j.PreviewSeq = len(j.previews)
+				}
 				j.PreviewStage = stageNames[stage]
 				j.PreviewStep = step
 				j.PreviewTotal = total
@@ -156,12 +184,20 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		steps:       int(formUint(r, "steps", 12)),
 		guidance:    formFloat(r, "guidance", 7.5),
 		wantPreview: r.FormValue("preview") != "0", // live 3D previews unless opted out
+		keyframes:   int(formUint(r, "keyframes", 0)),
 	}
 	if j.steps < 1 || j.steps > 50 {
 		j.steps = 12
 	}
 	if j.guidance < 0 || j.guidance > 20 {
 		j.guidance = 7.5
+	}
+	// keyframes cost extra decodes and are only meaningful with previews on
+	if j.keyframes > 8 {
+		j.keyframes = 8
+	}
+	if j.keyframes < 0 || !j.wantPreview {
+		j.keyframes = 0
 	}
 
 	s.mu.Lock()
@@ -235,9 +271,11 @@ func (s *server) handleMesh(w http.ResponseWriter, r *http.Request) {
 	binary.Write(w, binary.LittleEndian, mesh.Tris)
 }
 
-// handlePreview streams the latest live intermediate-preview blob (a T2VOX01
-// voxel set) for a running job. The browser polls /api/job for previewSeq and
-// fetches this whenever it advances, swapping the voxels into the viewer.
+// handlePreview streams a recorded intermediate-preview frame for a job. With
+// ?seq=N it returns that frame by index (the browser fetches every frame it is
+// missing so the scrubber can replay the whole generation); without it, the
+// latest frame (back-compat live view). Frames are T2VOX01 voxel sets or
+// T2MESH0* keyframe meshes; the client dispatches on the magic.
 func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	j := s.getJob(r, "/api/preview/")
 	if j == nil {
@@ -245,10 +283,17 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.mu.Lock()
-	blob := j.preview
+	var blob []byte
+	if q := r.URL.Query().Get("seq"); q != "" {
+		if i, err := strconv.Atoi(q); err == nil && i >= 0 && i < len(j.previews) {
+			blob = j.previews[i]
+		}
+	} else if n := len(j.previews); n > 0 {
+		blob = j.previews[n-1]
+	}
 	j.mu.Unlock()
 	if blob == nil {
-		http.Error(w, "no preview yet", http.StatusConflict)
+		http.Error(w, "no such preview frame", http.StatusConflict)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -375,6 +420,14 @@ func main() {
 	noTexture := flag.Bool("no-texture", false, "disable PBR texturing (geometry only)")
 	addr := flag.String("addr", ":8742", "listen address")
 	flag.Parse()
+
+	// Recorded previews: capture one voxel frame per SS step (finer than the
+	// library's ~4-frame default) so the scrubber has a smooth structure-forming
+	// sequence to replay. The library reads T2_PREVIEW_STRIDE; respect an
+	// explicit override, else default to per-step.
+	if os.Getenv("T2_PREVIEW_STRIDE") == "" {
+		os.Setenv("T2_PREVIEW_STRIDE", "1")
+	}
 
 	pick := func(explicit, name string) string {
 		if explicit != "" {
