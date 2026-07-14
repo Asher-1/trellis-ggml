@@ -208,7 +208,7 @@ func configuredCaps(m engineModels) int {
 		if m.slatHR != "" {
 			caps |= cap1024
 		}
-		if m.texDec != "" && m.texFlow != "" {
+		if m.shapeEnc != "" && m.texDec != "" && m.texFlow != "" {
 			caps |= capTexture
 		}
 	}

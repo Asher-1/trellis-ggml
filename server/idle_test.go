@@ -62,8 +62,12 @@ func TestConfiguredCapsForLazyStartup(t *testing.T) {
 		{"coarse", engineModels{}, capCoarse},
 		{"512", engineModels{slat: "slat", shapeDec: "shape"}, capCoarse | cap512},
 		{"1024 textured", engineModels{
-			slat: "slat", slatHR: "hr", shapeDec: "shape", texDec: "texdec", texFlow: "texflow",
+			slat: "slat", slatHR: "hr", shapeDec: "shape", shapeEnc: "shapeenc",
+			texDec: "texdec", texFlow: "texflow",
 		}, capCoarse | cap512 | cap1024 | capTexture},
+		{"texture missing encoder", engineModels{
+			slat: "slat", shapeDec: "shape", texDec: "texdec", texFlow: "texflow",
+		}, capCoarse | cap512},
 		{"incomplete fine", engineModels{slat: "slat", texDec: "texdec", texFlow: "texflow"}, capCoarse},
 	}
 	for _, tt := range tests {

@@ -94,7 +94,7 @@ typedef struct t2_mesh_result t2_mesh_result;
 ** available qualities:
 **   - slat_flow_gguf + shape_dec_gguf present  -> 512 fine dual-grid
 **   - + slat_hr_flow_gguf present               -> 1024 cascade (reuses shape_dec)
-**   - tex_dec_gguf + tex_flow_gguf present      -> integrated PBR texturing
+**   - shape_enc_gguf + tex_dec_gguf + tex_flow_gguf -> PBR texturing
 **   - neither pair                              -> coarse marching-cubes preview
 ** `flags` is a bitmask of t2_load_flags (0 for standard resident loading).
 ** On failure returns NULL and, if err != NULL, writes a reason into err. */
@@ -106,8 +106,8 @@ TRELLIS2_CAPI t2_pipeline * t2_pipeline_load(const char * dino_gguf,
                                              const char * shape_dec_gguf,
                                              /* PBR texturing (optional; NULL/"" to disable). The tex
                                              ** models are loaded lazily per-generate, not held resident.
-                                             ** shape_enc_gguf is retained for ABI/source compatibility
-                                             ** but is no longer used by integrated generation. */
+                                             ** The validated generation path uses shape_enc_gguf to
+                                             ** re-encode the decoded dual grid before texture flow. */
                                              const char * shape_enc_gguf,
                                              const char * tex_dec_gguf,
                                              const char * tex_flow_gguf,

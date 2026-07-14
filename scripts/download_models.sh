@@ -38,8 +38,8 @@ fetch $T2 ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.json       TRELLIS.2-4B
 fetch $T2 ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors TRELLIS.2-4B
 fetch $T2 ckpts/shape_dec_next_dc_f16c32_fp16.json               TRELLIS.2-4B
 fetch $T2 ckpts/shape_dec_next_dc_f16c32_fp16.safetensors        TRELLIS.2-4B
-# PBR texturing stack: integrated generation needs the tex decoder and tex-SLAT
-# flows. The shape encoder is also fetched for standalone mesh-texturing parity.
+# PBR texturing stack: the validated generation path needs the shape encoder,
+# texture decoder, and both texture-SLAT flows.
 fetch $T2 texturing_pipeline.json                                TRELLIS.2-4B
 fetch $T2 ckpts/shape_enc_next_dc_f16c32_fp16.json               TRELLIS.2-4B
 fetch $T2 ckpts/shape_enc_next_dc_f16c32_fp16.safetensors        TRELLIS.2-4B

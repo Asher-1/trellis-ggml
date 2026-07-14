@@ -893,7 +893,7 @@ func main() {
 	slat := flag.String("slat", "", "512 shape-slat flow gguf (default <ggufs>/slat_flow_f16.gguf)")
 	slatHR := flag.String("slat-hr", "", "1024 shape-slat flow gguf (default <ggufs>/slat_flow_1024_f16.gguf)")
 	shapeDec := flag.String("shape-dec", "", "shape decoder gguf (default <ggufs>/shape_dec_f16.gguf)")
-	shapeEnc := flag.String("shape-enc", "", "deprecated: integrated texturing no longer needs a shape encoder")
+	shapeEnc := flag.String("shape-enc", "", "shape encoder gguf (default <ggufs>/shape_enc_f16.gguf)")
 	texDec := flag.String("tex-dec", "", "texture decoder gguf (default <ggufs>/tex_dec_f16.gguf)")
 	texSlat := flag.String("tex-slat", "", "512 texture-slat flow gguf (default <ggufs>/tex_slat_flow_512_f16.gguf)")
 	texSlatHR := flag.String("tex-slat-hr", "", "1024 texture-slat flow gguf (default <ggufs>/tex_slat_flow_1024_f16.gguf)")
@@ -937,13 +937,13 @@ func main() {
 					slatHRPath = ""
 				}
 			}
-			// Integrated PBR texturing uses the generated shape latent directly and
-			// therefore needs only the texture decoder and texture flow.
+			// The validated PBR path re-encodes the decoded dual grid, so all three
+			// model families are required: shape encoder, texture decoder, and flow.
 			if !*noTexture {
-				shapeEncPath = *shapeEnc // accepted for older invocations; ignored by ABI 6
+				shapeEncPath = pick(*shapeEnc, "shape_enc_f16.gguf")
 				texDecPath = pick(*texDec, "tex_dec_f16.gguf")
 				texSlatPath = pick(*texSlat, "tex_slat_flow_512_f16.gguf")
-				if fileExists(texDecPath) && fileExists(texSlatPath) {
+				if fileExists(shapeEncPath) && fileExists(texDecPath) && fileExists(texSlatPath) {
 					texSlatHRPath = pick(*texSlatHR, "tex_slat_flow_1024_f16.gguf")
 					if !fileExists(texSlatHRPath) {
 						if slatHRPath != "" {
@@ -953,7 +953,7 @@ func main() {
 						texSlatHRPath = ""
 					}
 				} else {
-					log.Printf("texture models not found, geometry only")
+					log.Printf("shape encoder or texture models not found, geometry only")
 					shapeEncPath, texDecPath, texSlatPath = "", "", ""
 				}
 			}
@@ -967,7 +967,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	backend, caps, _, loaded := eng.Info()
+	backend, caps, textured, loaded := eng.Info()
 	mode := "coarse (marching cubes)"
 	if caps&cap1024 != 0 {
 		mode = "1024 cascade (+ 512 fine, coarse)"
@@ -975,9 +975,9 @@ func main() {
 		mode = "512 fine (+ coarse)"
 	}
 	if loaded {
-		log.Printf("models loaded, backend: %s, qualities: %s", backend, mode)
+		log.Printf("models loaded, backend: %s, qualities: %s, PBR: %v", backend, mode, textured)
 	} else {
-		log.Printf("models configured for lazy load, backend: %s, qualities: %s", backend, mode)
+		log.Printf("models configured for lazy load, backend: %s, qualities: %s, PBR: %v", backend, mode, textured)
 	}
 
 	s := &server{

@@ -752,7 +752,7 @@ let previewingExport = false;
 
 function meshDescription(m, prefix) {
   return `${prefix}${m.nv.toLocaleString()} vertices · ${m.nt.toLocaleString()} triangles`
-    + (m.textured ? " · PBR" : "");
+    + (m.textured ? " · PBR" : " · no material");
 }
 
 function resetExportState() {
@@ -783,6 +783,11 @@ function exportQuery() {
 function exportSettingsChanged() {
   if (previewingExport) showOriginalExport();
   if (!glbJobId) return;
+  if (!originalExportMesh?.textured) {
+    $("exportinfo").textContent =
+      "warning: this saved mesh has no material data; its GLB will be geometry-only";
+    return;
+  }
   const mode = $("exportcomponents").value;
   $("exportinfo").textContent = mode === "largest"
     ? "warning: largest-piece cleanup removes every detached component"
