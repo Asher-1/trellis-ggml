@@ -47,6 +47,11 @@ back automatically if the shape-SLAT models are absent (`-coarse`); the 1024
 cascade needs the extra 1024 model (`-no-1024` disables it).
 Enable **free VRAM when idle** to unload the resident model pipeline between
 generations; the next queued generation reloads it automatically.
+**Live steps** is off by default because each sparse-structure frame requires an
+extra CPU occupancy decode between GPU inference steps. Its button always says
+`on` or `off`; enabling it records the frames used by replay and showcase mode.
+Completed jobs expose `durationMs`, `livePreview`, and per-stage `stageTimings`
+through `/api/job/{id}` and persist those diagnostics in their manifest.
 The always-visible **asset export** panel preserves the generated polygon count,
 can preview component cleanup, optionally keep only the largest connected piece,
 restore the original preview, and download a Three.js-ready GLB. Dense generated

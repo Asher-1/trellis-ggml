@@ -9,10 +9,10 @@
 //	GET  /                 self-contained WebGL viewer (embedded web/index.html)
 //	GET  /api/info         {backend, defaults}
 //	POST /api/settings     form unload_idle=0|1 -> current runtime settings
-//	POST /api/generate     multipart image [+ source, background, seed, steps, guidance, texture_steps, preview] -> {job}
+//	POST /api/generate     multipart image [+ source, background, seed, steps, guidance, texture_steps, preview=1] -> {job}
 //	POST /api/regenerate/{id} settings only; reuse the persisted generation input -> {job}
 //	GET  /api/jobs         durable completed-generation history
-//	GET  /api/job/{id}     {state, stage, step, total, previewSeq, error}
+//	GET  /api/job/{id}     {state, stage, step, total, previewSeq, livePreview, durationMs, stageTimings, error}
 //	GET  /api/source/{id}  original uploaded image (byte-for-byte when supplied)
 //	GET  /api/mesh/{id}    binary mesh: T2MESH01 geometry or T2MESH03 geometry +
 //	                       f32[6nv] PBR (base RGB, metal, roughness, alpha)
@@ -57,30 +57,43 @@ type frameMeta struct {
 	Kind  string `json:"kind"`
 }
 
+// stageTiming records aggregate wall time spent in a reported pipeline stage.
+// It includes CPU work and host/device handoff time, which a GPU-utilisation
+// graph alone cannot explain.
+type stageTiming struct {
+	Stage        string `json:"stage"`
+	Milliseconds int64  `json:"milliseconds"`
+}
+
 type job struct {
 	mu    sync.Mutex
 	ID    string `json:"id"`
 	State string `json:"state"` // queued | running | done | error
 	// CreatedAt and Quality are retained in the durable manifest for future
 	// server-side history/indexing as well as diagnostics.
-	CreatedAt int64  `json:"createdAt,omitempty"`
-	Quality   string `json:"quality,omitempty"`
-	Thumbnail string `json:"thumbnail,omitempty"`
-	Stage     string `json:"stage,omitempty"`
-	Step      int    `json:"step"`
-	Total     int    `json:"total"`
-	Error     string `json:"error,omitempty"`
+	CreatedAt  int64  `json:"createdAt,omitempty"`
+	StartedAt  int64  `json:"startedAt,omitempty"`
+	FinishedAt int64  `json:"finishedAt,omitempty"`
+	DurationMS int64  `json:"durationMs,omitempty"`
+	Quality    string `json:"quality,omitempty"`
+	Thumbnail  string `json:"thumbnail,omitempty"`
+	Stage      string `json:"stage,omitempty"`
+	Step       int    `json:"step"`
+	Total      int    `json:"total"`
+	Error      string `json:"error,omitempty"`
 
 	// Recorded intermediate 3D previews: every frame is kept (not just the
 	// latest) so the viewer can scrub the whole generation back and forth.
 	// PreviewSeq == number of frames recorded; the browser fetches any frame it
 	// is still missing by index (/api/preview/{id}?seq=N). Frames carries the
 	// per-frame stage/step/kind metadata for labelling the scrubber.
-	PreviewSeq   int         `json:"previewSeq"`
-	PreviewStage string      `json:"previewStage,omitempty"`
-	PreviewStep  int         `json:"previewStep"`
-	PreviewTotal int         `json:"previewTotal"`
-	Frames       []frameMeta `json:"frames,omitempty"`
+	PreviewSeq   int           `json:"previewSeq"`
+	PreviewStage string        `json:"previewStage,omitempty"`
+	PreviewStep  int           `json:"previewStep"`
+	PreviewTotal int           `json:"previewTotal"`
+	Frames       []frameMeta   `json:"frames,omitempty"`
+	LivePreview  bool          `json:"livePreview"`
+	StageTimings []stageTiming `json:"stageTimings,omitempty"`
 
 	image        []byte // processed image passed to TRELLIS
 	source       []byte // exact original upload, used for display and future edits
@@ -90,7 +103,6 @@ type job struct {
 	steps        int
 	textureSteps int
 	guidance     float32
-	wantPreview  bool
 	keyframes    int      // intermediate shape-SLAT mesh keyframes to record (0 = off)
 	previews     [][]byte // every preview blob, in order; served by /api/preview?seq=
 	mesh         *meshData
@@ -118,6 +130,46 @@ type server struct {
 
 func (s *server) worker() {
 	for j := range s.q {
+		started := time.Now()
+		currentStage := ""
+		stageStarted := started
+		addStageTime := func(stage string, elapsed time.Duration) {
+			ms := elapsed.Milliseconds()
+			if ms < 0 {
+				return
+			}
+			for i := range j.StageTimings {
+				if j.StageTimings[i].Stage == stage {
+					j.StageTimings[i].Milliseconds += ms
+					return
+				}
+			}
+			j.StageTimings = append(j.StageTimings, stageTiming{Stage: stage, Milliseconds: ms})
+		}
+		setStage := func(stage string, step, total int) {
+			now := time.Now()
+			j.mu.Lock()
+			if stage != currentStage {
+				if currentStage != "" {
+					addStageTime(currentStage, now.Sub(stageStarted))
+				}
+				currentStage, stageStarted = stage, now
+			}
+			j.Stage, j.Step, j.Total = stage, step, total
+			j.mu.Unlock()
+		}
+		finishTiming := func() {
+			finished := time.Now()
+			j.mu.Lock()
+			if currentStage != "" {
+				addStageTime(currentStage, finished.Sub(stageStarted))
+				currentStage = ""
+			}
+			j.FinishedAt = finished.UnixMilli()
+			j.DurationMS = finished.Sub(started).Milliseconds()
+			j.mu.Unlock()
+		}
+
 		s.mu.Lock()
 		s.queued--
 		s.active = true
@@ -125,6 +177,7 @@ func (s *server) worker() {
 
 		j.mu.Lock()
 		j.State = "running"
+		j.StartedAt = started.UnixMilli()
 		j.mu.Unlock()
 
 		// The library reads T2_KEYFRAMES for opt-in intermediate mesh keyframes.
@@ -133,7 +186,7 @@ func (s *server) worker() {
 		os.Setenv("T2_KEYFRAMES", strconv.Itoa(j.keyframes))
 
 		var onPreview func(stage, step, total int, blob []byte)
-		if j.wantPreview {
+		if j.LivePreview {
 			onPreview = func(stage, step, total int, blob []byte) {
 				j.mu.Lock()
 				if len(j.previews) < maxFrames {
@@ -155,17 +208,10 @@ func (s *server) worker() {
 
 		mesh, err := s.eng.Generate(j.image, j.pipeline, j.background, j.seed, j.steps, j.guidance, j.textureSteps,
 			func() {
-				j.mu.Lock()
-				j.Stage = "loading models"
-				j.Step, j.Total = 0, 0
-				j.mu.Unlock()
+				setStage("loading models", 0, 0)
 			},
 			func(stage, step, total int) {
-				j.mu.Lock()
-				j.Stage = stageNames[stage]
-				j.Step = step
-				j.Total = total
-				j.mu.Unlock()
+				setStage(stageNames[stage], step, total)
 			},
 			onPreview)
 
@@ -177,27 +223,27 @@ func (s *server) worker() {
 			j.Error = err.Error()
 		} else {
 			j.mesh = mesh
-			j.Stage = "saving generation"
-			j.Step, j.Total = 0, 0
 		}
 		j.mu.Unlock()
+		if err == nil {
+			setStage("saving generation", 0, 0)
+		}
 
 		s.mu.Lock()
 		s.active = false
 		s.mu.Unlock()
 		if s.unloadModelsIfIdle(func() {
-			j.mu.Lock()
-			j.Stage = "freeing VRAM"
-			j.Step, j.Total = 0, 0
-			j.mu.Unlock()
+			setStage("freeing VRAM", 0, 0)
 		}) {
 			log.Printf("models unloaded while idle")
 		}
 
 		if err == nil {
-			j.mu.Lock()
-			j.Stage = "saving generation"
-			j.mu.Unlock()
+			setStage("saving generation", 0, 0)
+			// Freeze inference/load/unload timings before writing the manifest so
+			// the diagnostics survive a server restart. Large mesh-file I/O is not
+			// part of the inference duration.
+			finishTiming()
 			if saveErr := s.persistJob(j); saveErr != nil {
 				// The result remains usable for this process. A persistence failure is
 				// operational, not a reason to discard an otherwise valid generation.
@@ -213,6 +259,8 @@ func (s *server) worker() {
 				j.source = nil
 			}
 			j.mu.Unlock()
+		} else {
+			finishTiming()
 		}
 
 		j.mu.Lock()
@@ -221,7 +269,16 @@ func (s *server) worker() {
 		}
 		j.Stage = ""
 		j.Step, j.Total = 0, 0
+		duration := j.DurationMS
+		timings := append([]stageTiming(nil), j.StageTimings...)
+		preview := j.LivePreview
 		j.mu.Unlock()
+		parts := make([]string, 0, len(timings))
+		for _, timing := range timings {
+			parts = append(parts, fmt.Sprintf("%s=%.1fs", timing.Stage, float64(timing.Milliseconds)/1000))
+		}
+		log.Printf("job %s finished in %.1fs (live preview: %t): %s",
+			j.ID, float64(duration)/1000, preview, strings.Join(parts, ", "))
 	}
 }
 
@@ -327,7 +384,7 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		steps:        int(formUint(r, "steps", 12)),
 		textureSteps: int(formUint(r, "texture_steps", 12)),
 		guidance:     formFloat(r, "guidance", 7.5),
-		wantPreview:  r.FormValue("preview") != "0", // live 3D previews unless opted out
+		LivePreview:  r.FormValue("preview") == "1", // expensive preview decodes are explicitly opt-in
 		keyframes:    int(formUint(r, "keyframes", 0)),
 	}
 	s.normaliseJob(j)
@@ -375,7 +432,7 @@ func (s *server) normaliseJob(j *job) {
 	if j.keyframes > 8 {
 		j.keyframes = 8
 	}
-	if j.keyframes < 0 || !j.wantPreview {
+	if j.keyframes < 0 || !j.LivePreview {
 		j.keyframes = 0
 	}
 }
@@ -460,7 +517,7 @@ func (s *server) handleRegenerate(w http.ResponseWriter, r *http.Request) {
 		seed:       formUint(r, "seed", seed), steps: int(formUint(r, "steps", uint64(steps))),
 		textureSteps: int(formUint(r, "texture_steps", uint64(textureSteps))),
 		guidance:     formFloat(r, "guidance", guidance),
-		wantPreview:  r.FormValue("preview") != "0",
+		LivePreview:  r.FormValue("preview") == "1",
 		keyframes:    int(formUint(r, "keyframes", 0)),
 	}
 	s.normaliseJob(j)

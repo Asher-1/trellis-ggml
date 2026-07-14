@@ -17,17 +17,22 @@ const persistedJobVersion = 1
 // state, caches, and locks never reach disk; only the data needed to restore a
 // completed generation is retained.
 type persistedJob struct {
-	Version      int         `json:"version"`
-	ID           string      `json:"id"`
-	CreatedAt    int64       `json:"createdAt"`
-	Quality      string      `json:"quality,omitempty"`
-	Thumbnail    string      `json:"thumbnail,omitempty"`
-	Pipeline     int         `json:"pipeline"`
-	Seed         uint64      `json:"seed"`
-	Steps        int         `json:"steps"`
-	TextureSteps int         `json:"textureSteps"`
-	Guidance     float32     `json:"guidance"`
-	Frames       []frameMeta `json:"frames,omitempty"`
+	Version      int           `json:"version"`
+	ID           string        `json:"id"`
+	CreatedAt    int64         `json:"createdAt"`
+	StartedAt    int64         `json:"startedAt,omitempty"`
+	FinishedAt   int64         `json:"finishedAt,omitempty"`
+	DurationMS   int64         `json:"durationMs,omitempty"`
+	Quality      string        `json:"quality,omitempty"`
+	Thumbnail    string        `json:"thumbnail,omitempty"`
+	Pipeline     int           `json:"pipeline"`
+	Seed         uint64        `json:"seed"`
+	Steps        int           `json:"steps"`
+	TextureSteps int           `json:"textureSteps"`
+	Guidance     float32       `json:"guidance"`
+	Frames       []frameMeta   `json:"frames,omitempty"`
+	LivePreview  bool          `json:"livePreview,omitempty"`
+	StageTimings []stageTiming `json:"stageTimings,omitempty"`
 }
 
 func persistedFrameName(i int) string {
@@ -49,10 +54,12 @@ func (s *server) persistJob(j *job) error {
 	}
 	manifest := persistedJob{
 		Version: persistedJobVersion, ID: j.ID, CreatedAt: j.CreatedAt,
+		StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, DurationMS: j.DurationMS,
 		Quality: j.Quality, Thumbnail: j.Thumbnail,
 		Pipeline: j.pipeline, Seed: j.seed, Steps: j.steps,
 		TextureSteps: j.textureSteps, Guidance: j.guidance,
-		Frames: append([]frameMeta(nil), j.Frames...),
+		Frames: append([]frameMeta(nil), j.Frames...), LivePreview: j.LivePreview,
+		StageTimings: append([]stageTiming(nil), j.StageTimings...),
 	}
 	mesh := j.mesh
 	input := j.image
@@ -203,8 +210,11 @@ func loadPersistedJob(dir string) (*job, error) {
 		}
 	}
 	return &job{
-		ID: m.ID, State: "done", CreatedAt: m.CreatedAt, Quality: m.Quality, Thumbnail: m.Thumbnail,
+		ID: m.ID, State: "done", CreatedAt: m.CreatedAt, StartedAt: m.StartedAt,
+		FinishedAt: m.FinishedAt, DurationMS: m.DurationMS,
+		Quality: m.Quality, Thumbnail: m.Thumbnail,
 		PreviewSeq: len(m.Frames), Frames: m.Frames,
+		LivePreview: m.LivePreview || len(m.Frames) > 0, StageTimings: m.StageTimings,
 		pipeline: m.Pipeline, seed: m.Seed, steps: m.Steps,
 		textureSteps: m.TextureSteps, guidance: m.Guidance,
 		persistDir: dir, meshPath: meshPath, inputPath: inputPath, sourcePath: sourcePath,

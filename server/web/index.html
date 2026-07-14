@@ -257,7 +257,8 @@
     <div class="toggles">
       <button id="twire">wireframe</button>
       <button id="tspin" class="on">auto-rotate</button>
-      <button id="tsteps" class="on" title="watch the shape emerge in 3D during generation">live steps</button>
+      <button id="tsteps" aria-pressed="false"
+              title="record the shape forming; adds CPU decodes between GPU inference steps">live steps: off</button>
       <button id="tkf" title="also record coarse mesh keyframes of the shape stage forming (slower)">keyframes</button>
     </div>
     <div id="histwrap" style="display:none">
@@ -301,13 +302,24 @@
 const $ = id => document.getElementById(id);
 const showcasePage = document.documentElement.classList.contains("showcase-only");
 let imageBlob = null;
-let stepsOn = true;   // stream live 3D previews of the intermediate stages
+let stepsOn = false;  // preview decoding is deliberately opt-in: it stalls GPU inference
 
 let kfOn = false;     // also record coarse mesh keyframes during the shape stage (opt-in, slower)
 $("tsteps").addEventListener("click", () => {
-  stepsOn = !stepsOn;
-  $("tsteps").classList.toggle("on", stepsOn);
+  setLiveSteps(!stepsOn);
 });
+function setLiveSteps(enabled) {
+  stepsOn = enabled;
+  $("tsteps").classList.toggle("on", enabled);
+  $("tsteps").textContent = `live steps: ${enabled ? "on" : "off"}`;
+  $("tsteps").setAttribute("aria-pressed", String(enabled));
+  if (!enabled) {
+    kfOn = false;
+    $("tkf").classList.remove("on");
+  }
+  $("tkf").disabled = !enabled;
+}
+setLiveSteps(false);
 $("tkf").addEventListener("click", () => {
   kfOn = !kfOn;
   $("tkf").classList.toggle("on", kfOn);
@@ -563,7 +575,8 @@ async function poll(id, thumb, quality) {
       await loadMesh(id);
       addHistory(id, thumb, quality);
       try { await refreshRuntimeInfo(); } catch (e) { /* informational only */ }
-      setStatus("done");
+      const elapsed = j.durationMs ? ` in ${(j.durationMs / 1000).toFixed(1)}s` : "";
+      setStatus(`done${elapsed} · live steps ${j.livePreview ? "on" : "off"}`);
       setTimeout(() => { $("bar").style.display = "none"; }, 600);
       return;
     }

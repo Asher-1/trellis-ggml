@@ -203,6 +203,9 @@ MAIN_CHECK = r"""
     pbrRange: range, webgl2: !!gl, glError: gl.getError(), centerPixel: [...pixel],
     canvas: {width: canvas.width, height: canvas.height,
              cssWidth: canvas.clientWidth, cssHeight: canvas.clientHeight},
+    liveSteps: {text: document.getElementById('tsteps').textContent,
+                pressed: document.getElementById('tsteps').getAttribute('aria-pressed'),
+                keyframesDisabled: document.getElementById('tkf').disabled},
     exportEnabled: !document.getElementById('dglb').disabled,
     regenerateEnabled: !document.getElementById('regen').disabled,
   };
@@ -292,6 +295,9 @@ def main():
                 failures.append("main page base colour is effectively constant")
             if main_result["status"] != "done":
                 failures.append(f"main page status is {main_result['status']!r}")
+            if main_result["liveSteps"] != {
+                    "text": "live steps: off", "pressed": "false", "keyframesDisabled": True}:
+                failures.append(f"live steps did not default clearly off: {main_result['liveSteps']!r}")
             if showcase_result["loadedAssets"] != showcase_result["historyCount"]:
                 failures.append("showcase did not load every persisted asset")
             if not showcase_result["webgl2"] or showcase_result["glError"] != 0:

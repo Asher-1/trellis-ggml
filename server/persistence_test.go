@@ -59,9 +59,11 @@ func TestPersistAndRestoreCompletedJob(t *testing.T) {
 	wantPreviews := [][]byte{[]byte("T2VOX01-frame"), []byte("T2MESH01-frame")}
 	j := &job{
 		ID: "0123456789abcdef", State: "running", CreatedAt: 123456789,
+		StartedAt: 123456800, FinishedAt: 123499000, DurationMS: 42200,
 		Quality: "1024", Thumbnail: "data:image/jpeg;base64,dGVzdA==",
-		PreviewSeq: len(wantFrames), Frames: wantFrames,
-		pipeline: pipe1024, seed: 42, steps: 12, textureSteps: 10, guidance: 7.5,
+		PreviewSeq: len(wantFrames), Frames: wantFrames, LivePreview: true,
+		StageTimings: []stageTiming{{Stage: "sampling sparse structure", Milliseconds: 21000}},
+		pipeline:     pipe1024, seed: 42, steps: 12, textureSteps: 10, guidance: 7.5,
 		previews: wantPreviews, mesh: testPersistedMesh(true),
 		image: []byte("processed-input"), source: []byte("exact-original"),
 	}
@@ -81,7 +83,10 @@ func TestPersistAndRestoreCompletedJob(t *testing.T) {
 	}
 	got := restarted.jobs[j.ID]
 	if got == nil || got.State != "done" || got.Quality != "1024" ||
-		got.Thumbnail != j.Thumbnail || got.CreatedAt != j.CreatedAt {
+		got.Thumbnail != j.Thumbnail || got.CreatedAt != j.CreatedAt ||
+		got.StartedAt != j.StartedAt || got.FinishedAt != j.FinishedAt ||
+		got.DurationMS != j.DurationMS || got.LivePreview != j.LivePreview ||
+		!reflect.DeepEqual(got.StageTimings, j.StageTimings) {
 		t.Fatalf("restored metadata = %#v", got)
 	}
 	if got.mesh != nil || len(got.previews) != 0 {
@@ -154,7 +159,7 @@ func TestRegenerateUsesPersistedInputWithoutUpload(t *testing.T) {
 	if regenerated.Quality != "1024" || regenerated.pipeline != pipe1024 ||
 		regenerated.background != backgroundKeep || regenerated.seed != 42 ||
 		regenerated.steps != 14 || regenerated.textureSteps != 15 ||
-		regenerated.guidance != 8 || regenerated.wantPreview {
+		regenerated.guidance != 8 || regenerated.LivePreview {
 		t.Fatalf("regenerated settings = %#v", regenerated)
 	}
 }
