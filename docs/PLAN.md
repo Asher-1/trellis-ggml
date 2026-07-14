@@ -24,9 +24,11 @@ image (RGBA preferred)
 Fallback shipped at every point in time: marching-cubes preview mesh from the 64³
 occupancy (already works), so the demo is demoable before the SLAT stages land.
 
-Skipped for now: background removal net (BiRefNet/RMBG-2.0 — a separate ~1GB model;
-demo instructs transparent-background PNG, uses image as-is otherwise), texture
-stack, 1024/1536 cascade paths.
+The upstream neural background-removal net (BiRefNet/RMBG-2.0, a separate ~1 GB
+model) remains out of scope. The port does include deterministic removal of
+near-black/near-white backgrounds connected to the image border, with soft alpha
+edges and browser controls to force or disable it. Texture and cascade status is
+tracked below.
 
 ## Weights
 
@@ -160,8 +162,11 @@ generations exercise the free/reload path with no OOM.
 
 ## Not done (out of original scope / future)
 
-- **PBR textures** — the tex-SLAT flow + tex decoder + UV/bake stack. Explicitly
-  deferred ("initial goal is just the mesh").
+- **PBR textures — DONE.** The validated standalone texturing path re-encodes
+  the decoded dual grid to condition texture flow, then trilinearly samples the
+  decoded six-channel PBR volume at the surface. The browser and GLB path
+  preserve alpha and use the correct base-color space. The first integrated
+  subdivision-guide path was removed after it produced collapsed materials.
 - **`1024_cascade` — DONE.** Full high-resolution path: LR flow (512 model) →
   `trellis2_shape_dec_upsample(×4)` → quantize+dedup to the 64³ HR scaffold →
   HR flow (1024 model, cond_1024) → 1024³ decode → dual-grid mesh. Enabled by

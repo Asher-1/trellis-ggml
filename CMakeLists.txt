@@ -50,21 +50,16 @@ add_library(trellis2
     trellis2.cpp trellis2.h
     trellis2_capi.cpp trellis2_capi.h
     mesh_export.cpp mesh_export.h
-    third_party/xatlas/xatlas.cpp
-    third_party/meshoptimizer/simplifier.cpp
-    third_party/meshoptimizer/indexgenerator.cpp
-    third_party/meshoptimizer/vfetchoptimizer.cpp
-    third_party/meshoptimizer/allocator.cpp)
+    third_party/xatlas/xatlas.cpp)
 target_include_directories(trellis2 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/stb
 )
 # trellis2_capi.cpp reuses the example isosurface extractor for the demo path;
-# mesh_export.cpp vendors xatlas (UV unwrap) and Simplify.h (QEM decimation).
+# mesh_export.cpp vendors xatlas for the optional chart-based UV unwrap.
 target_include_directories(trellis2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/examples
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xatlas
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/meshoptimizer)
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xatlas)
 
 find_package(Threads REQUIRED)  # xatlas uses std::thread
 

@@ -435,6 +435,15 @@ struct trellis2_shape_dec_taps {
     std::vector<std::vector<float>> data;
 };
 
+// One decoder upsample level. For every fine (output) voxel, cidx identifies
+// the selected child in the coarse [C*8, L_coarse] feature tensor. Shape
+// decoding can return these levels so another decoder (notably the texture VAE)
+// can reproduce exactly the same sparse hierarchy.
+struct trellis2_subdiv_level {
+    std::vector<int32_t> fine_coords;   // [Lf * 3]
+    std::vector<int32_t> cidx;          // [Lf]
+};
+
 // Decode the (denormalized) structured latent into per-voxel dual-grid fields.
 //   slat       : [L * latent_channels] floats, voxel-major
 //   coords     : [L * 3] int32 at the input resolution (32^3 scaffold)
@@ -447,6 +456,18 @@ trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
                           std::vector<int32_t> & out_coords,
                           trellis2_shape_dec_taps * taps = nullptr,
                           std::string * error = nullptr);
+
+// Full shape decode plus the predicted sparse subdivision hierarchy, in decoder
+// order (out_subs[0] is the first/coarsest upsample). This is the integrated
+// image-to-3D texture path's guide_subs equivalent.
+TRELLIS2_API bool
+trellis2_shape_dec_decode_with_subs(trellis2_shape_dec_model * m,
+                                    const float * slat, int n_voxels, const int32_t * coords,
+                                    std::vector<float> & out_feats,
+                                    std::vector<int32_t> & out_coords,
+                                    std::vector<trellis2_subdiv_level> & out_subs,
+                                    trellis2_shape_dec_taps * taps = nullptr,
+                                    std::string * error = nullptr);
 
 // Predict just the subdivided coordinate set after `upsample_times` levels,
 // without running the output layer — mirrors FlexiDualGridVaeDecoder.upsample(),
@@ -461,17 +482,15 @@ trellis2_shape_dec_upsample(trellis2_shape_dec_model * m,
                             std::string * error = nullptr);
 
 /*****************************************************************************
-** Public API – Shape-SLAT VAE encoder (FlexiDualGridVaeEncoder) — texturing
+** Public API – Shape-SLAT VAE encoder (FlexiDualGridVaeEncoder)
 **
 ** The mirror of the shape decoder: a 6-channel dual grid ([offset(3),
 ** intersected(3)] per active voxel at resolution R) is downsampled 16x through
 ** SparseSpatial2Channel (S2C) blocks into a 32-channel latent at R/16 (the
-** "shape SLAT", used as concat_cond by the texture flow). Because the input
-** dual grid can be taken straight from the shape decoder's own 7-channel output
-** (offset = (1+2m)sigmoid(f[0:3])-m, intersected = f[3:6]>0), no CUDA QEF
-** re-encode is needed. The per-level subdivision recorded by each S2C is handed
-** to the texture decoder (which has pred_subdiv=False) so it reconstructs
-** exactly this voxel set.
+** "shape SLAT"). This is used by the standalone arbitrary-mesh texturing API
+** and its parity test. Integrated image-to-3D generation retains the original
+** generated shape SLAT and shape-decoder subdivisions instead of performing a
+** lossy decode/encode round trip.
 *****************************************************************************/
 
 struct trellis2_shape_enc_hparams {
@@ -482,15 +501,6 @@ struct trellis2_shape_enc_hparams {
     int32_t num_blocks[8]   = {0};  // [0, 4, 8, 16, 4]
     float   norm_eps        = 1e-6f;
     int32_t file_type       = 0;
-};
-
-// One S2C level, in decoder order (subs[0] is the coarsest upsample the tex
-// decoder runs first). For each fine (output) voxel: its coordinate and the
-// gather index cidx = subidx + 8*parent_row into the coarse [C*8, L_coarse]
-// features — the exact SparseChannel2Spatial replay the tex decoder consumes.
-struct trellis2_subdiv_level {
-    std::vector<int32_t> fine_coords;   // [Lf * 3]
-    std::vector<int32_t> cidx;          // [Lf]
 };
 
 struct trellis2_shape_enc_model;
@@ -542,7 +552,7 @@ trellis2_tex_dec_load(const std::string & path,
 // Decode the (denormalized) texture SLAT into per-voxel PBR, replaying `subs`.
 //   slat       : [L * latent_channels] tex SLAT, voxel-major.
 //   coords     : [L * 3] latent voxels (== the shape SLAT coords).
-//   subs       : the encoder's per-level subdivisions (decoder order).
+//   subs       : shape decoder or encoder per-level subdivisions (decoder order).
 //   out_feats  : [M * 6] PBR, voxel-major, already in [0,1].
 //   out_coords : [M * 3] at R; a permutation-free reproduction of the encoder's
 //                input voxel order (so PBR voxel v == mesh vertex v).
@@ -641,12 +651,27 @@ trellis2_dino_encode_rgb(trellis2_dino_model * m,
 /*****************************************************************************
 ** Public API – Image preprocessing (TRELLIS.2 pipeline.preprocess_image)
 **
-** For an RGBA input with a meaningful alpha channel (the "has_alpha" path;
-** background removal nets are not ported): downscale so max(W,H) <= 1024,
+** For an RGBA input with a meaningful alpha channel (the "has_alpha" path):
+** downscale so max(W,H) <= 1024,
 ** square-crop around the alpha>0.8 bounding box, premultiply onto black, and
 ** LANCZOS-resize to out_size x out_size RGB. The resampler reproduces PIL's
 ** fixed-point uint8 Lanczos-3 so results match the Python pipeline.
 *****************************************************************************/
+
+enum trellis2_background_mode {
+    TRELLIS2_BACKGROUND_AUTO  = 0,
+    TRELLIS2_BACKGROUND_KEEP  = 1,
+    TRELLIS2_BACKGROUND_BLACK = 2,
+    TRELLIS2_BACKGROUND_WHITE = 3,
+};
+
+// Replace a near-black/near-white background connected to the image border
+// with softly feathered alpha. AUTO leaves images with meaningful existing
+// alpha or a non-black/non-white border unchanged. Returns pixels whose alpha
+// changed, or -1 for invalid arguments.
+TRELLIS2_API int
+trellis2_remove_solid_background_rgba(uint8_t * rgba, int w, int h,
+                                      int mode = TRELLIS2_BACKGROUND_AUTO);
 
 // rgba: [h * w * 4] bytes. On success out_rgb has out_size*out_size*3 bytes.
 // Fails if the image has no pixels with alpha > 0.8*255.

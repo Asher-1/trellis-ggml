@@ -143,14 +143,33 @@ int main(int argc, char ** argv) {
 
     std::vector<float> out_feats;
     std::vector<int32_t> out_coords;
+    std::vector<trellis2_subdiv_level> subs;
     trellis2_shape_dec_taps taps;
-    if (!trellis2_shape_dec_decode(dec, slat.data(), L, coords.data(),
-                                   out_feats, out_coords, &taps, &err)) {
+    if (!trellis2_shape_dec_decode_with_subs(dec, slat.data(), L, coords.data(),
+                                             out_feats, out_coords, subs, &taps, &err)) {
         std::fprintf(stderr, "decode failed: %s\n", err.c_str());
         trellis2_shape_dec_free(dec);
         return 1;
     }
     trellis2_shape_dec_free(dec);
+
+    // Integrated texture generation replays these exact decoder decisions in
+    // the texture VAE. Guard their order/shape independently of activation taps.
+    if (subs.size() != 4) {
+        std::printf("  -> subdivision guide has %zu levels, expected 4, FAIL\n", subs.size());
+        ++n_fail;
+    } else {
+        for (size_t lvl = 0; lvl < subs.size(); ++lvl) {
+            if (subs[lvl].fine_coords.size() != subs[lvl].cidx.size() * 3) {
+                std::printf("  -> subdivision level %zu coord/index size mismatch, FAIL\n", lvl);
+                ++n_fail;
+            }
+        }
+        if (subs.back().fine_coords != out_coords) {
+            std::printf("  -> final subdivision guide does not reproduce decoder coords, FAIL\n");
+            ++n_fail;
+        }
+    }
 
     // The decoder's per-level active set is chosen by subdivision-logit signs;
     // if my logits match the reference's, every level's voxel set (hence tap

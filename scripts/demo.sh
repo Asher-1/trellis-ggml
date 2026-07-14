@@ -24,4 +24,4 @@ docker rm -f trellis2-demo-run 2>/dev/null || true
 exec docker run --rm --name trellis2-demo-run --device nvidia.com/gpu=all \
     -v "$ROOT":/work -w /work/server -p "$PORT":8742 trellis2-demo \
     ./trellis2-server-linux -lib /work/build-cuda-shared/libtrellis2.so \
-    -ggufs /work/ggufs -addr :8742 "$@"
+    -ggufs /work/ggufs -store /work/generations -unload-idle -addr :8742 "$@"

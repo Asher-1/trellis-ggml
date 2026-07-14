@@ -26,7 +26,7 @@
 extern "C" {
 #endif
 
-#define T2_CAPI_ABI_VERSION 5
+#define T2_CAPI_ABI_VERSION 9
 
 TRELLIS2_CAPI int t2_abi_version(void);
 
@@ -42,7 +42,7 @@ enum t2_stage {
     T2_STAGE_UPSAMPLE     = 7,  /* cascade: LR slat -> HR voxel scaffold  */
     T2_STAGE_SLAT_FLOW_HR = 8,  /* cascade: 1024 shape-SLAT flow (steps)  */
     T2_STAGE_SHAPE_DEC_HR = 9,  /* cascade: 1024^3 shape decoder          */
-    T2_STAGE_TEXTURE      = 10  /* PBR texture: encode+flow+decode        */
+    T2_STAGE_TEXTURE      = 10  /* PBR texture: flow + guided decode      */
 };
 
 /* Pipeline type for t2_generate. */
@@ -53,11 +53,20 @@ enum t2_pipeline_type {
     T2_PIPE_1024    = 3   /* 1024 cascade                                    */
 };
 
-/* Capability bits reported by t2_pipeline_caps (which qualities are loaded). */
+/* Solid-background handling before the alpha-bbox crop. */
+enum t2_background_mode {
+    T2_BACKGROUND_AUTO  = 0, /* detect border-connected near-black/near-white */
+    T2_BACKGROUND_KEEP  = 1, /* preserve the decoded alpha exactly             */
+    T2_BACKGROUND_BLACK = 2, /* force removal of border-connected near-black   */
+    T2_BACKGROUND_WHITE = 3  /* force removal of border-connected near-white   */
+};
+
+/* Capability bits reported by t2_pipeline_caps (loaded qualities/features). */
 enum t2_caps {
     T2_CAP_COARSE = 1,
     T2_CAP_512    = 2,
-    T2_CAP_1024   = 4
+    T2_CAP_1024   = 4,
+    T2_CAP_TEXTURE = 8
 };
 
 /* Load-time flags for t2_pipeline_load. */
@@ -85,6 +94,7 @@ typedef struct t2_mesh_result t2_mesh_result;
 ** available qualities:
 **   - slat_flow_gguf + shape_dec_gguf present  -> 512 fine dual-grid
 **   - + slat_hr_flow_gguf present               -> 1024 cascade (reuses shape_dec)
+**   - tex_dec_gguf + tex_flow_gguf present      -> integrated PBR texturing
 **   - neither pair                              -> coarse marching-cubes preview
 ** `flags` is a bitmask of t2_load_flags (0 for standard resident loading).
 ** On failure returns NULL and, if err != NULL, writes a reason into err. */
@@ -95,7 +105,9 @@ TRELLIS2_CAPI t2_pipeline * t2_pipeline_load(const char * dino_gguf,
                                              const char * slat_hr_flow_gguf,
                                              const char * shape_dec_gguf,
                                              /* PBR texturing (optional; NULL/"" to disable). The tex
-                                             ** models are loaded lazily per-generate, not held resident. */
+                                             ** models are loaded lazily per-generate, not held resident.
+                                             ** shape_enc_gguf is retained for ABI/source compatibility
+                                             ** but is no longer used by integrated generation. */
                                              const char * shape_enc_gguf,
                                              const char * tex_dec_gguf,
                                              const char * tex_flow_gguf,
@@ -103,7 +115,7 @@ TRELLIS2_CAPI t2_pipeline * t2_pipeline_load(const char * dino_gguf,
                                              int flags,
                                              char * err, int err_len);
 
-/* Bitmask of t2_caps: which mesh qualities this pipeline can produce. */
+/* Bitmask of t2_caps: which mesh qualities/features this pipeline can produce. */
 TRELLIS2_CAPI int t2_pipeline_caps(t2_pipeline * p);
 /* Back-compat: 1 if any fine (512/1024) path is available, else 0. */
 TRELLIS2_CAPI int t2_pipeline_is_fine(t2_pipeline * p);
@@ -112,15 +124,18 @@ TRELLIS2_CAPI const char *  t2_pipeline_backend(t2_pipeline * p);
 
 /* image bytes (PNG/JPEG/...; anything stb_image decodes) -> triangle mesh.
 ** pipeline_type is a t2_pipeline_type (T2_PIPE_AUTO picks the best available).
-** steps <= 0 and guidance < 0 select the pipeline defaults (12 / 7.5).
+** background_mode is a t2_background_mode (normally T2_BACKGROUND_AUTO).
+** steps <= 0, guidance < 0, and texture_steps <= 0 select the pipeline defaults
+** (12 / 7.5 / 12 respectively).
 ** `preview` (may be NULL) streams live intermediate 3D previews as the sparse
 ** structure emerges; `preview_user` is passed back to it. The T2_PREVIEW_STRIDE
 ** env var (default: ~4 previews across the SS steps) tunes the per-step cadence.
 ** NOT thread-safe per pipeline: serialize calls on one t2_pipeline. */
 TRELLIS2_CAPI t2_mesh_result * t2_generate(t2_pipeline * p,
                                            const void * image_bytes, int image_len,
-                                           int pipeline_type,
+                                           int pipeline_type, int background_mode,
                                            uint64_t seed, int steps, float guidance,
+                                           int texture_steps,
                                            t2_progress_fn progress, void * user,
                                            t2_preview_fn preview, void * preview_user,
                                            char * err, int err_len);
@@ -133,26 +148,36 @@ TRELLIS2_CAPI int           t2_mesh_n_tris (const t2_mesh_result * r);
 TRELLIS2_CAPI const float * t2_mesh_verts  (const t2_mesh_result * r); /* 3*n_verts   */
 TRELLIS2_CAPI const float * t2_mesh_normals(const t2_mesh_result * r); /* 3*n_verts   */
 TRELLIS2_CAPI const int *   t2_mesh_tris   (const t2_mesh_result * r); /* 3*n_tris    */
-/* Per-vertex PBR (5*n_verts: base_color rgb, metallic, roughness), or NULL when
+/* Per-vertex PBR (6*n_verts: base_color rgb, metallic, roughness, alpha), or NULL when
 ** the mesh is untextured. t2_mesh_has_pbr reports availability. */
 TRELLIS2_CAPI int           t2_mesh_has_pbr(const t2_mesh_result * r);
-TRELLIS2_CAPI const float * t2_mesh_pbr    (const t2_mesh_result * r); /* 5*n_verts   */
+TRELLIS2_CAPI const float * t2_mesh_pbr    (const t2_mesh_result * r); /* 6*n_verts   */
 TRELLIS2_CAPI void          t2_mesh_free   (t2_mesh_result * r);
 
-/* Bake a mesh into a portable UV-atlas-textured GLB (glTF 2.0 binary): QEM
-** decimate -> xatlas UV unwrap -> per-texel PBR bake (from the dense per-vertex
-** attributes) -> gutter inpaint -> glTF. All CPU, no CUDA.
-**   verts  3*n_verts, tris  3*n_tris, pbr  5*n_verts (base_color rgb, metallic,
-**   roughness) or NULL for an untextured grey bake.
+/* Prepare the exact component-cleaned geometry used for export so hosts can preview it.
+** component_filter: 0 removes only tiny islands; 1 keeps the largest connected
+** component; 2 keeps all components. The returned mesh owns copied PBR and is
+** freed with t2_mesh_free. */
+TRELLIS2_CAPI t2_mesh_result * t2_prepare_mesh(const float * verts, int n_verts,
+                                               const int * tris, int n_tris,
+                                               const float * pbr,
+                                               int component_filter,
+                                               char * err, int err_len);
+
+/* Bake a mesh into a portable UV-atlas-textured GLB (glTF 2.0 binary): optional
+** component cleanup -> UV unwrap -> per-texel PBR bake (from the dense
+** per-vertex attributes) -> gutter inpaint -> glTF. All CPU, no CUDA.
+**   verts  3*n_verts, tris  3*n_tris, pbr  6*n_verts (base_color rgb, metallic,
+**   roughness, alpha) or NULL for an untextured grey bake.
 **   texture_size  square atlas resolution hint (e.g. 2048; <=0 -> default).
-**   target_tris   decimation target triangle count (<=0 -> default).
+**   component_filter  0 remove tiny islands, 1 largest only, 2 keep all.
 ** Operates on raw arrays so hosts can bake straight from their own buffers.
 ** On success returns a malloc'd GLB buffer (free with t2_free_buffer) and writes
 ** its length to *out_len; on failure returns NULL with a reason in err. */
 TRELLIS2_CAPI uint8_t * t2_bake_glb(const float * verts, int n_verts,
                                     const int * tris, int n_tris,
                                     const float * pbr,
-                                    int texture_size, int target_tris,
+                                    int texture_size, int component_filter,
                                     int * out_len, char * err, int err_len);
 TRELLIS2_CAPI void      t2_free_buffer(uint8_t * buf);
 

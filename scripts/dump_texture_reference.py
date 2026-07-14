@@ -18,9 +18,10 @@ stage validates in isolation (feed identical inputs, compare outputs):
   shape_slat_mean/std  [32]   shape_slat_normalization (concat_cond in-norm)
   tex_slat_mean/std    [32]   tex_slat_normalization   (output de-norm)
 
-The encoder is fed the QEF dual grid (o_voxel.mesh_to_flexible_dual_grid) so the
-golden is reproducible; the C++ demo instead feeds the shape DECODER's own dual
-grid (validated end-to-end by eyeballing the demo, not here).
+This dump validates the standalone arbitrary-mesh texturing path, whose encoder
+is fed a reproducible QEF dual grid. Integrated image-to-3D generation instead
+retains the generated shape SLat and replays the shape decoder's subdivisions;
+that wiring is covered by test_slat plus the sparse PBR sampling regression.
 
 Run inside the reference container (real o-voxel), e.g.:
   docker exec t2tex bash -lc \

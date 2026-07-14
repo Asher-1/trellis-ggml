@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Load a textured GLB and render it three ways by sampling the baked UV atlas,
-so a wrong unwrap / flipped texture / bad axis shows up immediately. Also prints
-structural stats (a sanity check that the glTF is well-formed).
+"""Load a GLB and render it three ways from vertex colour or a baked UV atlas.
+Also prints structural stats (a sanity check that the glTF is well-formed).
 
     python3 scripts/render_glb.py in.glb [out.png]
 
@@ -16,32 +15,45 @@ mesh = scene if isinstance(scene, trimesh.Trimesh) else list(scene.geometry.valu
 
 V = np.asarray(mesh.vertices, np.float64)
 F = np.asarray(mesh.faces, np.int64)
-uv = np.asarray(mesh.visual.uv, np.float64)
-mat = mesh.visual.material
-base_img = np.asarray(mat.baseColorTexture.convert("RGB"), np.float64) / 255.0
-try:
-    mr_img = np.asarray(mat.metallicRoughnessTexture.convert("RGB"), np.float64) / 255.0
-except Exception:
-    mr_img = None
-print(f"GLB: {len(V):,} verts  {len(F):,} faces  uv[{uv.min():.3f},{uv.max():.3f}]  "
-      f"baseColor {base_img.shape}  metalRough {None if mr_img is None else mr_img.shape}",
-      flush=True)
-
-TH, TW = base_img.shape[:2]
-
-def sample(img, u, v):
-    # glTF UV: (0,0) top-left, V down. Nearest sample.
-    x = np.clip((u % 1.0) * (TW - 1), 0, TW - 1).astype(np.int32)
-    y = np.clip((v % 1.0) * (TH - 1), 0, TH - 1).astype(np.int32)
-    return img[y, x]
-
-# Per-vertex sampled attributes (fast, smooth enough for a validation render).
-base_v = sample(base_img, uv[:, 0], uv[:, 1])
-if mr_img is not None:
-    rough_v = sample(mr_img, uv[:, 0], uv[:, 1])[:, 1]
-    metal_v = sample(mr_img, uv[:, 0], uv[:, 1])[:, 2]
+visual_attrs = getattr(mesh.visual, "vertex_attributes", {})
+if "color" in visual_attrs:
+    raw = np.asarray(visual_attrs["color"])
+    scale = np.iinfo(raw.dtype).max if np.issubdtype(raw.dtype, np.integer) else 1.0
+    base_v = np.asarray(raw[:, :3], np.float64) / scale
+    # glTF COLOR_0 is already linear.
+    base_linear_v = np.clip(base_v, 0, 1)
+    custom = getattr(mesh, "vertex_attributes", {})
+    if "_METALLIC_ROUGHNESS" in custom:
+        mr = np.asarray(custom["_METALLIC_ROUGHNESS"])
+        mr_scale = np.iinfo(mr.dtype).max if np.issubdtype(mr.dtype, np.integer) else 1.0
+        metal_v = np.asarray(mr[:, 0], np.float64) / mr_scale
+        rough_v = np.asarray(mr[:, 1], np.float64) / mr_scale
+    else:
+        metal_v = np.zeros(len(V)); rough_v = np.full(len(V), 0.6)
+    print(f"GLB: {len(V):,} verts  {len(F):,} faces  COLOR_0 {raw.dtype}  "
+          f"custom metalRough={'yes' if '_METALLIC_ROUGHNESS' in custom else 'no'}", flush=True)
 else:
-    rough_v = np.full(len(V), 0.6); metal_v = np.zeros(len(V))
+    uv = np.asarray(mesh.visual.uv, np.float64)
+    mat = mesh.visual.material
+    base_img = np.asarray(mat.baseColorTexture.convert("RGB"), np.float64) / 255.0
+    try:
+        mr_img = np.asarray(mat.metallicRoughnessTexture.convert("RGB"), np.float64) / 255.0
+    except Exception:
+        mr_img = None
+    TH, TW = base_img.shape[:2]
+    def sample(img, u, v):
+        x = np.clip((u % 1.0) * (TW - 1), 0, TW - 1).astype(np.int32)
+        y = np.clip((v % 1.0) * (TH - 1), 0, TH - 1).astype(np.int32)
+        return img[y, x]
+    base_v = sample(base_img, uv[:, 0], uv[:, 1])
+    base_linear_v = np.clip(base_v, 0, 1) ** 2.2
+    if mr_img is not None:
+        rough_v = sample(mr_img, uv[:, 0], uv[:, 1])[:, 1]
+        metal_v = sample(mr_img, uv[:, 0], uv[:, 1])[:, 2]
+    else:
+        rough_v = np.full(len(V), 0.6); metal_v = np.zeros(len(V))
+    print(f"GLB: {len(V):,} verts  {len(F):,} faces  uv[{uv.min():.3f},{uv.max():.3f}]  "
+          f"baseColor {base_img.shape}  metalRough {None if mr_img is None else mr_img.shape}", flush=True)
 
 N = np.zeros_like(V)
 fn = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
@@ -68,7 +80,7 @@ def render(el, az):
     sx = ((P[:, 0]*.5+.5)*(W-1)).astype(np.int32); sy = ((.5-P[:, 1]*.5)*(H-1)).astype(np.int32)
     z = P[:, 2]
     view = np.array([0., 0., 1.]); nv_ = np.abs(Nr @ view)
-    F0 = 0.04*(1-metal_v)[:, None] + base_v*metal_v[:, None]
+    F0 = 0.04*(1-metal_v)[:, None] + base_linear_v*metal_v[:, None]
     Fr = F0 + (1-F0)*((1-nv_)[:, None]**5)
     shin = 6.0 + 214.0*np.clip(1-rough_v, 0, 1)**1.5
     sn = (shin+2.0)/(2*np.pi)
@@ -78,7 +90,7 @@ def render(el, az):
         diffuse += Lc[None]*w*ndl[:, None]
         h = l+view; h = h/np.linalg.norm(h); nh = np.abs(Nr @ h)
         specular += Lc[None]*w*(nh[:, None]**shin[:, None])*sn[:, None]*ndl[:, None]
-    albedo = base_v*(1-metal_v)[:, None]
+    albedo = base_linear_v*(1-metal_v)[:, None]
     hemi = np.abs(N[:, 1])*0.5+0.5
     amb = (1-hemi)[:, None]*np.array([.20, .19, .22]) + hemi[:, None]*np.array([.55, .58, .66])
     col = np.clip(albedo*(amb*0.55 + diffuse*0.75) + specular*Fr + Fr*0.25, 0, 1)

@@ -56,4 +56,5 @@ __pycache__/
 /models/
 /ggufs/
 /dumps/
+/generations/
 slow-unit-*

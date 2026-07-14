@@ -7,6 +7,7 @@
 #include "trellis2_capi.h"
 #include "trellis2.h"
 #include "mesh_export.h"
+#include "pbr_utils.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -22,6 +23,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -66,7 +68,7 @@ struct t2_pipeline {
 };
 
 // A generated mesh: verts (3/vertex), normals (3/vertex), tris (3/tri), and
-// optional per-vertex PBR (5/vertex: base_color rgb, metallic, roughness).
+// optional per-vertex PBR (6/vertex: base_color rgb, metallic, roughness, alpha).
 struct t2_mesh_result {
     std::vector<float> verts;
     std::vector<float> normals;
@@ -104,10 +106,6 @@ void ensure_decode_vram(t2_pipeline * p, int pipeline_type) {
     trellis2_ss_flow_free(p->flow);      p->flow    = nullptr;
     trellis2_slat_flow_free(p->slat);    p->slat    = nullptr;
     trellis2_slat_flow_free(p->slat_hr); p->slat_hr = nullptr;
-}
-
-inline uint64_t vox_key(int32_t a, int32_t b, int32_t c) {
-    return ((uint64_t) (uint32_t) a << 42) | ((uint64_t) (uint32_t) b << 21) | (uint64_t) (uint32_t) c;
 }
 
 // ── live intermediate 3D previews (voxel sets) ───────────────────────────────
@@ -255,53 +253,79 @@ struct ss_preview_ctx {
     std::vector<float> *  occ    = nullptr;   // scratch [res^3], caller-owned
 };
 
-// PBR-texture stage on the freshly decoded dual grid: encode the shape SLAT,
-// sample the texture SLAT (concat_cond on the shape SLAT), decode to per-voxel
-// PBR, and map it onto the mesh vertices (vertex v == decode voxel v). The tex
-// models (~4 GB) are loaded here — after the geometry flow DiTs are freed by
-// ensure_decode_vram — and freed on return, so they never coexist in VRAM.
+// PBR-texture stage on the freshly decoded dual grid. Encoding the decoder
+// output again is less direct than replaying the shape decoder's subdivisions,
+// but it is the numerically validated path used by test_texture. In particular,
+// it avoids the all-saturated material regression seen with the first integrated
+// subdivision-guide implementation. The decoded PBR volume is still sampled at
+// the actual mesh vertices rather than copied by voxel index.
 bool run_texture_stage(t2_pipeline * p,
                        const std::vector<float> & dec_feats,
-                       const std::vector<int32_t> & dec_coords, int pt,
+                       const std::vector<int32_t> & dec_coords,
+                       const std::vector<float> & mesh_verts, int grid, int pt,
                        const trellis2_dino_cond & cond, uint64_t seed,
+                       int texture_steps,
                        t2_progress_fn progress, void * user,
                        std::vector<float> & pbr_out, std::string & e) {
     const int nvox = (int) (dec_coords.size() / 3);
-    if (progress) progress(user, T2_STAGE_TEXTURE, 0, 0);
+    if (nvox <= 0 || dec_feats.size() != (size_t) nvox * 7) {
+        e = "invalid decoded dual grid"; return false;
+    }
 
-    // 6-ch encoder input from the 7-ch dual grid: dual-vertex offset
-    // ((1+2m)sigmoid(f)-m) and intersection flag (f > 0).
+    // Shape-encoder input from the seven-channel dual grid: learned dual-vertex
+    // offset plus the three intersection flags. This matches the standalone
+    // texturing pipeline fixture and preserves its exact subdivision replay.
     const float mg = 0.5f;
     std::vector<float> in6((size_t) nvox * 6);
     for (int v = 0; v < nvox; ++v) {
         const float * f = dec_feats.data() + (size_t) v * 7;
         for (int c = 0; c < 3; ++c) {
             const float s = 1.0f / (1.0f + std::exp(-f[c]));
-            in6[(size_t) v * 6 + c]     = (1.0f + 2.0f * mg) * s - mg;
+            in6[(size_t) v * 6 + c] = (1.0f + 2.0f * mg) * s - mg;
             in6[(size_t) v * 6 + 3 + c] = f[3 + c] > 0.0f ? 1.0f : 0.0f;
         }
     }
 
+    if (progress) progress(user, T2_STAGE_TEXTURE, 0, texture_steps > 0 ? texture_steps : 12);
     trellis2_shape_enc_model * enc = trellis2_shape_enc_load(p->shapeenc_path.c_str(), true, &e);
     if (!enc) { e = "shape_enc load: " + e; return false; }
-    std::vector<float> shape_slat; std::vector<int32_t> lat_coords;
+    std::vector<float> shape_slat;
+    std::vector<int32_t> lat_coords;
     std::vector<trellis2_subdiv_level> subs;
     bool ok = trellis2_shape_enc_encode(enc, in6.data(), nvox, dec_coords.data(),
                                         shape_slat, lat_coords, subs, nullptr, &e);
     trellis2_shape_enc_free(enc);
     if (!ok) { e = "shape encode: " + e; return false; }
-    const int Nl = (int) (lat_coords.size() / 3);
 
-    // texture SLAT flow (concat_cond). 1024 mesh -> texflow_hr when available.
-    const std::string & fp = (pt == T2_PIPE_1024 && !p->texflow_hr_path.empty())
-                             ? p->texflow_hr_path : p->texflow_path;
+    const int Nl = (int) (lat_coords.size() / 3);
+    if (Nl <= 0 || shape_slat.size() != (size_t) Nl * 32) {
+        e = "invalid generated shape SLAT"; return false;
+    }
+    if (subs.empty()) { e = "missing shape decoder subdivision guide"; return false; }
+
+    // A 64^3/1024 shape SLAT must use the 1024 material model; feeding it to the
+    // 32^3/512 model is not a valid fallback.
+    if (pt == T2_PIPE_1024 && p->texflow_hr_path.empty()) {
+        e = "1024 texture flow model is not loaded"; return false;
+    }
+    const std::string & fp = pt == T2_PIPE_1024 ? p->texflow_hr_path : p->texflow_path;
     trellis2_slat_flow_model * flow = trellis2_slat_flow_load(fp.c_str(), true, &e);
     if (!flow) { e = "tex_flow load: " + e; return false; }
     std::vector<float> tex_slat((size_t) Nl * 32);
     trellis2_ss_sampler_params tp;   // texturing_pipeline.json tex_slat_sampler
-    tp.steps = 12; tp.guidance_strength = 1.0f; tp.guidance_rescale = 0.0f;
+    tp.steps = texture_steps > 0 ? texture_steps : 12;
+    tp.guidance_strength = 1.0f; tp.guidance_rescale = 0.0f;
     tp.guidance_interval_min = 0.6f; tp.guidance_interval_max = 0.9f; tp.rescale_t = 3.0f;
     tp.seed = seed ^ 0x7e00ULL; tp.verbose = false;
+    struct tex_progress_ctx { t2_progress_fn fn; void * user; } pc{progress, user};
+    if (progress) {
+        progress(user, T2_STAGE_TEXTURE, 0, tp.steps);
+        tp.progress = [](void * u, int step, int total) {
+            auto * c = (tex_progress_ctx *) u;
+            c->fn(c->user, T2_STAGE_TEXTURE, step, total);
+        };
+        tp.progress_user = &pc;
+    }
     ok = trellis2_slat_flow_sample_tex(flow, Nl, lat_coords.data(),
                                        cond.data.data(), (int) cond.tokens(), (int) cond.channels(),
                                        shape_slat.data(), &tp, nullptr, /*denormalize*/ true,
@@ -309,7 +333,8 @@ bool run_texture_stage(t2_pipeline * p,
     trellis2_slat_flow_free(flow);
     if (!ok) { e = "tex sample: " + e; return false; }
 
-    // texture decoder -> per-voxel 6-ch PBR, replaying the encoder's subdivision.
+    // Texture decoder -> sparse six-channel PBR, replaying the shape decoder's
+    // subdivision hierarchy (upstream's guide_subs).
     trellis2_shape_dec_model * texdec = trellis2_tex_dec_load(p->texdec_path.c_str(), true, &e);
     if (!texdec) { e = "tex_dec load: " + e; return false; }
     std::vector<float> pbr; std::vector<int32_t> pbr_coords;
@@ -318,19 +343,38 @@ bool run_texture_stage(t2_pipeline * p,
     trellis2_shape_dec_free(texdec);
     if (!ok) { e = "tex decode: " + e; return false; }
 
-    // map PBR onto mesh vertices by voxel coord (robust to ordering). 5/vertex.
+    // Sample at the actual dual-grid vertex positions, not their parent voxel
+    // coordinates. q = (xyz + 0.5) * grid is upstream's MeshWithVoxel query.
     const int M = (int) (pbr_coords.size() / 3);
-    std::unordered_map<uint64_t, int> pm;
-    pm.reserve((size_t) M * 2);
-    for (int i = 0; i < M; ++i)
-        pm[vox_key(pbr_coords[(size_t) i*3], pbr_coords[(size_t) i*3+1], pbr_coords[(size_t) i*3+2])] = i;
-    pbr_out.assign((size_t) nvox * 5, 0.5f);
-    for (int v = 0; v < nvox; ++v) {
-        auto it = pm.find(vox_key(dec_coords[(size_t) v*3], dec_coords[(size_t) v*3+1], dec_coords[(size_t) v*3+2]));
-        if (it == pm.end()) continue;
-        const float * s = pbr.data() + (size_t) it->second * 6;
-        float * d = pbr_out.data() + (size_t) v * 5;
-        d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3]; d[4] = s[4];
+    if (M <= 0 || pbr.size() != (size_t) M * 6) {
+        e = "texture decoder returned an invalid PBR volume"; return false;
+    }
+    const int nv = (int) (mesh_verts.size() / 3);
+    std::vector<float> query((size_t) nv * 3), weights((size_t) nv);
+    for (int v = 0; v < nv; ++v)
+        for (int c = 0; c < 3; ++c)
+            query[(size_t) v * 3 + c] = (mesh_verts[(size_t) v * 3 + c] + 0.5f) * grid;
+    pbr_out.resize((size_t) nv * 6);
+    t2pbr::sample_sparse_trilinear(pbr.data(), M, 6, pbr_coords.data(),
+                                   query.data(), nv, pbr_out.data(), weights.data());
+    for (int v = 0; v < nv; ++v) {
+        float * d = pbr_out.data() + (size_t) v * 6;
+        if (weights[(size_t) v] <= 1e-6f) {
+            d[0] = d[1] = d[2] = 0.5f;
+            d[3] = 0.0f; d[4] = 0.5f; d[5] = 1.0f;
+        } else {
+            for (int c = 0; c < 6; ++c) d[c] = std::max(0.0f, std::min(1.0f, d[c]));
+        }
+    }
+
+    // An opaque material can legitimately be white, metallic, or rough, but a
+    // decoder result with essentially every one of the six channels pinned to
+    // one is a collapsed latent, not a usable texture. Never silently persist
+    // that as a successful textured generation again.
+    if (t2pbr::is_collapsed_saturated(pbr_out.data(), nv)) {
+        pbr_out.clear();
+        e = "texture decoder produced a collapsed saturated material";
+        return false;
     }
     return true;
 }
@@ -416,14 +460,40 @@ t2_pipeline * t2_pipeline_load(const char * dino_gguf,
             p->cascade = true;
         }
 
-        // PBR texturing: enabled when the shape encoder, tex decoder, and (at
-        // least the 512) tex flow are all present. The tex models are loaded
+        // PBR texturing: enabled when the shape encoder, texture decoder, and
+        // (at least the 512) texture flow are present. The tex models are loaded
         // lazily per-generate (run_texture_stage), so only their paths are kept.
         if (present(shape_enc_gguf) && present(tex_dec_gguf) && present(tex_flow_gguf)) {
             std::string ve;
             trellis2_shape_enc_model * te = trellis2_shape_enc_load(shape_enc_gguf, false, &ve);
             if (!te) { copy_err(err, err_len, "shape_enc: " + ve); t2_pipeline_free(p); return nullptr; }
             trellis2_shape_enc_free(te);
+            trellis2_shape_dec_model * td = trellis2_tex_dec_load(tex_dec_gguf, false, &ve);
+            if (!td) { copy_err(err, err_len, "tex_dec: " + ve); t2_pipeline_free(p); return nullptr; }
+            if (trellis2_shape_dec_hparams_of(td).out_channels != 6) {
+                trellis2_shape_dec_free(td);
+                copy_err(err, err_len, "tex_dec: expected 6 output channels");
+                t2_pipeline_free(p); return nullptr;
+            }
+            trellis2_shape_dec_free(td);
+            trellis2_slat_flow_model * tf = trellis2_slat_flow_load(tex_flow_gguf, false, &ve);
+            if (!tf) { copy_err(err, err_len, "tex_flow: " + ve); t2_pipeline_free(p); return nullptr; }
+            if (trellis2_slat_flow_hparams_of(tf).concat_cond_channels != 32) {
+                trellis2_slat_flow_free(tf);
+                copy_err(err, err_len, "tex_flow: expected 32 concat-conditioning channels");
+                t2_pipeline_free(p); return nullptr;
+            }
+            trellis2_slat_flow_free(tf);
+            if (present(tex_flow_hr_gguf)) {
+                tf = trellis2_slat_flow_load(tex_flow_hr_gguf, false, &ve);
+                if (!tf) { copy_err(err, err_len, "tex_flow_hr: " + ve); t2_pipeline_free(p); return nullptr; }
+                if (trellis2_slat_flow_hparams_of(tf).concat_cond_channels != 32) {
+                    trellis2_slat_flow_free(tf);
+                    copy_err(err, err_len, "tex_flow_hr: expected 32 concat-conditioning channels");
+                    t2_pipeline_free(p); return nullptr;
+                }
+                trellis2_slat_flow_free(tf);
+            }
             p->shapeenc_path   = shape_enc_gguf;
             p->texdec_path     = tex_dec_gguf;
             p->texflow_path    = tex_flow_gguf;
@@ -441,6 +511,7 @@ int t2_pipeline_caps(t2_pipeline * p) {
     int c = T2_CAP_COARSE;
     if (p->fine)    c |= T2_CAP_512;
     if (p->cascade) c |= T2_CAP_1024;
+    if (p->texture) c |= T2_CAP_TEXTURE;
     return c;
 }
 
@@ -461,9 +532,10 @@ const char * t2_pipeline_backend(t2_pipeline * p) {
     return p ? p->backend.c_str() : "none";
 }
 
-int t2_preprocess_image_bytes(const void * image_bytes, int image_len,
-                              int out_size, unsigned char * out_rgb,
-                              char * err, int err_len) {
+static int preprocess_image_bytes_mode(const void * image_bytes, int image_len,
+                                       int out_size, unsigned char * out_rgb,
+                                       int background_mode,
+                                       char * err, int err_len) {
     if (!image_bytes || image_len <= 0 || out_size <= 0 || !out_rgb) {
         copy_err(err, err_len, "invalid arguments");
         return 1;
@@ -486,11 +558,16 @@ int t2_preprocess_image_bytes(const void * image_bytes, int image_len,
         return 1;
     }
 
-    // Images without an alpha channel are used as-is (no background removal
-    // net): force full opacity so the crop covers the whole subject square.
-    if (comp < 4) {
-        for (int i = 0; i < w * h; ++i) px[(size_t) i * 4 + 3] = 255;
+    // stb supplies opaque alpha for inputs without it and preserves alpha for
+    // grayscale+alpha, RGBA, and transparent palette images. Turn an otherwise
+    // opaque border-connected near-black/near-white background into alpha before
+    // the reference alpha-bbox crop; meaningful existing masks are trusted.
+    if (background_mode < T2_BACKGROUND_AUTO || background_mode > T2_BACKGROUND_WHITE) {
+        stbi_image_free(px);
+        copy_err(err, err_len, "invalid background mode");
+        return 1;
     }
+    trellis2_remove_solid_background_rgba(px, w, h, background_mode);
 
     std::string e;
     std::vector<uint8_t> rgb;
@@ -504,10 +581,17 @@ int t2_preprocess_image_bytes(const void * image_bytes, int image_len,
     return 0;
 }
 
+int t2_preprocess_image_bytes(const void * image_bytes, int image_len,
+                              int out_size, unsigned char * out_rgb,
+                              char * err, int err_len) {
+    return preprocess_image_bytes_mode(image_bytes, image_len, out_size, out_rgb,
+                                       T2_BACKGROUND_AUTO, err, err_len);
+}
+
 t2_mesh_result * t2_generate(t2_pipeline * p,
                              const void * image_bytes, int image_len,
-                             int pipeline_type,
-                             uint64_t seed, int steps, float guidance,
+                             int pipeline_type, int background_mode,
+                             uint64_t seed, int steps, float guidance, int texture_steps,
                              t2_progress_fn progress, void * user,
                              t2_preview_fn preview, void * preview_user,
                              char * err, int err_len) {
@@ -542,7 +626,8 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
     if (progress) progress(user, T2_STAGE_PREPROCESS, 0, 0);
     std::vector<unsigned char> rgb((size_t) S * S * 3);
     char perr[256] = {0};
-    if (t2_preprocess_image_bytes(image_bytes, image_len, S, rgb.data(), perr, sizeof(perr))) {
+    if (preprocess_image_bytes_mode(image_bytes, image_len, S, rgb.data(),
+                                    background_mode, perr, sizeof(perr))) {
         copy_err(err, err_len, perr);
         return nullptr;
     }
@@ -750,7 +835,8 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
 
         // 1024-res conditioning (separate preprocess + encode at 1024)
         std::vector<unsigned char> rgb1024((size_t) 1024 * 1024 * 3);
-        if (t2_preprocess_image_bytes(image_bytes, image_len, 1024, rgb1024.data(), perr, sizeof(perr))) {
+        if (preprocess_image_bytes_mode(image_bytes, image_len, 1024, rgb1024.data(),
+                                        background_mode, perr, sizeof(perr))) {
             copy_err(err, err_len, perr); delete r; return nullptr;
         }
         if (!trellis2_dino_encode_rgb(p->dino, rgb1024.data(), 1024, cond1024, &e)) {
@@ -796,7 +882,7 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
     }
     // Clean up the raw dual-grid soup: drop floating specks, then fill the small
     // boundary holes extract() left. Both only edit triangles (no new vertices),
-    // so PBR voxel v == vertex v still holds for the texture stage.
+    // so the generated material volume can still be sampled at every vertex.
     fdg::drop_small_components(mesh);
     fdg::fill_holes(mesh);
     r->verts   = std::move(mesh.verts);
@@ -823,13 +909,13 @@ t2_mesh_result * t2_generate(t2_pipeline * p,
         const trellis2_dino_cond & texcond = (pt == T2_PIPE_1024) ? cond1024 : cond;
         std::vector<float> pbr;
         std::string te;
-        if (run_texture_stage(p, dec_feats, dec_coords, pt, texcond, seed ^ 0x7ec0ULL,
-                              progress, user, pbr, te)) {
-            r->pbr = std::move(pbr);
-        } else {
-            // texturing failure is non-fatal — return the untextured mesh
-            std::fprintf(stderr, "[texture] failed: %s (returning untextured mesh)\n", te.c_str());
+        if (!run_texture_stage(p, dec_feats, dec_coords, r->verts, grid, pt,
+                               texcond, seed ^ 0x7ec0ULL,
+                               texture_steps, progress, user, pbr, te)) {
+            copy_err(err, err_len, "texture: " + te);
+            delete r; return nullptr;
         }
+        r->pbr = std::move(pbr);
     }
     return r;
 }
@@ -843,8 +929,35 @@ int t2_mesh_has_pbr(const t2_mesh_result * r) { return (r && !r->pbr.empty()) ? 
 const float * t2_mesh_pbr(const t2_mesh_result * r) { return (r && !r->pbr.empty()) ? r->pbr.data() : nullptr; }
 void t2_mesh_free(t2_mesh_result * r) { delete r; }
 
+t2_mesh_result * t2_prepare_mesh(const float * verts, int n_verts,
+                                 const int * tris, int n_tris,
+                                 const float * pbr,
+                                 int component_filter,
+                                 char * err, int err_len) {
+    if (!verts || !tris || n_verts <= 0 || n_tris <= 0) {
+        copy_err(err, err_len, "empty mesh"); return nullptr;
+    }
+    if (component_filter < 0 || component_filter > 2) {
+        copy_err(err, err_len, "bad component filter"); return nullptr;
+    }
+    t2glb::MeshExportOptions opt;
+    opt.components = (t2glb::ComponentFilter) component_filter;
+    t2glb::PreparedMesh prepared;
+    std::string e;
+    if (!t2glb::prepare_mesh(verts, n_verts, (const int32_t *) tris, n_tris,
+                             pbr, opt, prepared, e)) {
+        copy_err(err, err_len, e); return nullptr;
+    }
+    auto * r = new t2_mesh_result();
+    r->verts = std::move(prepared.verts);
+    r->normals = std::move(prepared.normals);
+    r->tris.assign(prepared.tris.begin(), prepared.tris.end());
+    r->pbr = std::move(prepared.pbr);
+    return r;
+}
+
 uint8_t * t2_bake_glb(const float * verts, int n_verts, const int * tris, int n_tris,
-                      const float * pbr, int texture_size, int target_tris,
+                      const float * pbr, int texture_size, int component_filter,
                       int * out_len, char * err, int err_len) {
     if (out_len) *out_len = 0;
     if (!verts || !tris || n_verts <= 0 || n_tris <= 0) {
@@ -852,7 +965,10 @@ uint8_t * t2_bake_glb(const float * verts, int n_verts, const int * tris, int n_
     }
     t2glb::MeshExportOptions opt;
     if (texture_size > 0) opt.texture_size = texture_size;
-    if (target_tris  > 0) opt.target_tris  = target_tris;
+    if (component_filter < 0 || component_filter > 2) {
+        copy_err(err, err_len, "bad component filter"); return nullptr;
+    }
+    opt.components = (t2glb::ComponentFilter) component_filter;
     std::vector<uint8_t> glb;
     std::string e;
     if (!t2glb::mesh_to_glb(verts, n_verts, tris, n_tris, pbr, opt, glb, e)) {

@@ -10,6 +10,11 @@ from PIL import Image
 path = sys.argv[1]; out = sys.argv[2] if len(sys.argv) > 2 else "glb_atlas.png"
 scene = trimesh.load(path, process=False)
 mesh = scene if isinstance(scene, trimesh.Trimesh) else list(scene.geometry.values())[0]
+attrs = getattr(mesh.visual, "vertex_attributes", {})
+if "color" in attrs:
+    color = np.asarray(attrs["color"])
+    print(f"vertex-colour GLB: {len(color):,} COLOR_0 values ({color.dtype}); no UV atlas")
+    sys.exit(0)
 mat = mesh.visual.material
 bc = mat.baseColorTexture.convert("RGB")
 try:

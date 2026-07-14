@@ -5,12 +5,18 @@
 //	./trellis2-server -lib ../build-shared/libtrellis2.so -ggufs ../ggufs
 //
 // API:
+//
 //	GET  /                 self-contained WebGL viewer (embedded web/index.html)
 //	GET  /api/info         {backend, defaults}
-//	POST /api/generate     multipart image [+ seed, steps, guidance, preview] -> {job}
+//	POST /api/settings     form unload_idle=0|1 -> current runtime settings
+//	POST /api/generate     multipart image [+ source, background, seed, steps, guidance, texture_steps, preview] -> {job}
+//	POST /api/regenerate/{id} settings only; reuse the persisted generation input -> {job}
+//	GET  /api/jobs         durable completed-generation history
 //	GET  /api/job/{id}     {state, stage, step, total, previewSeq, error}
-//	GET  /api/mesh/{id}    binary mesh: "T2MESH01" u32 nv u32 nt f32[3nv] verts
-//	                       f32[3nv] normals u32[3nt] tris (little-endian)
+//	GET  /api/source/{id}  original uploaded image (byte-for-byte when supplied)
+//	GET  /api/mesh/{id}    binary mesh: T2MESH01 geometry or T2MESH03 geometry +
+//	                       f32[6nv] PBR (base RGB, metal, roughness, alpha)
+//	GET  /api/export-preview/{id} full-density/component-filtered T2MESH0* geometry
 //	GET  /api/preview/{id} latest live 3D preview: "T2VOX01" u32 res u32 nvox
 //	                       u16[3nvox] voxel coords (little-endian)
 package main
@@ -28,15 +34,19 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 //go:embed web
 var webFS embed.FS
 
-const maxUpload = 32 << 20 // 32 MiB
-const maxFrames = 256      // cap recorded preview frames per job (bounds memory)
+const maxImage = 32 << 20                    // 32 MiB per original/processed image
+const maxUpload = (2 * maxImage) + (2 << 20) // both images plus multipart fields
+const maxFrames = 256                        // cap recorded preview frames per job (bounds memory)
 
 // frameMeta describes one recorded intermediate-preview frame so the viewer can
 // label and order the scrubber. Kind is "voxel" (T2VOX01) or "mesh" (T2MESH0*).
@@ -51,10 +61,15 @@ type job struct {
 	mu    sync.Mutex
 	ID    string `json:"id"`
 	State string `json:"state"` // queued | running | done | error
-	Stage string `json:"stage,omitempty"`
-	Step  int    `json:"step"`
-	Total int    `json:"total"`
-	Error string `json:"error,omitempty"`
+	// CreatedAt and Quality are retained in the durable manifest for future
+	// server-side history/indexing as well as diagnostics.
+	CreatedAt int64  `json:"createdAt,omitempty"`
+	Quality   string `json:"quality,omitempty"`
+	Thumbnail string `json:"thumbnail,omitempty"`
+	Stage     string `json:"stage,omitempty"`
+	Step      int    `json:"step"`
+	Total     int    `json:"total"`
+	Error     string `json:"error,omitempty"`
 
 	// Recorded intermediate 3D previews: every frame is kept (not just the
 	// latest) so the viewer can scrub the whole generation back and forth.
@@ -67,28 +82,47 @@ type job struct {
 	PreviewTotal int         `json:"previewTotal"`
 	Frames       []frameMeta `json:"frames,omitempty"`
 
-	image       []byte
-	pipeline    int
-	seed        uint64
-	steps       int
-	guidance    float32
-	wantPreview bool
-	keyframes   int      // intermediate shape-SLAT mesh keyframes to record (0 = off)
-	previews    [][]byte // every preview blob, in order; served by /api/preview?seq=
-	mesh        *meshData
-	glb         []byte // cached last GLB bake
-	glbKey      string // "tex-tris" the cached GLB was baked with
+	image        []byte // processed image passed to TRELLIS
+	source       []byte // exact original upload, used for display and future edits
+	pipeline     int
+	background   int
+	seed         uint64
+	steps        int
+	textureSteps int
+	guidance     float32
+	wantPreview  bool
+	keyframes    int      // intermediate shape-SLAT mesh keyframes to record (0 = off)
+	previews     [][]byte // every preview blob, in order; served by /api/preview?seq=
+	mesh         *meshData
+	exportMesh   *meshData // cached component-cleanup preview for exportKey
+	exportKey    string    // component mode
+	glb          []byte    // cached last GLB bake
+	glbKey       string    // "tex-components" the cached GLB was baked with
+	persistDir   string    // committed on-disk job directory; empty before save
+	meshPath     string    // final T2MESH file, loaded lazily after a restart
+	inputPath    string    // processed generation input, persisted for regeneration
+	sourcePath   string    // exact original upload, persisted for showcase/display
 }
 
 type server struct {
-	eng  *engine
-	mu   sync.Mutex
-	jobs map[string]*job
-	q    chan *job
+	eng        *engine
+	mu         sync.Mutex
+	lifecycle  sync.Mutex // serializes idle unloads with accepting new work
+	jobs       map[string]*job
+	q          chan *job
+	queued     int
+	active     bool
+	unloadIdle bool
+	storeDir   string // durable completed-job store; empty disables persistence
 }
 
 func (s *server) worker() {
 	for j := range s.q {
+		s.mu.Lock()
+		s.queued--
+		s.active = true
+		s.mu.Unlock()
+
 		j.mu.Lock()
 		j.State = "running"
 		j.mu.Unlock()
@@ -119,7 +153,13 @@ func (s *server) worker() {
 			}
 		}
 
-		mesh, err := s.eng.Generate(j.image, j.pipeline, j.seed, j.steps, j.guidance,
+		mesh, err := s.eng.Generate(j.image, j.pipeline, j.background, j.seed, j.steps, j.guidance, j.textureSteps,
+			func() {
+				j.mu.Lock()
+				j.Stage = "loading models"
+				j.Step, j.Total = 0, 0
+				j.mu.Unlock()
+			},
 			func(stage, step, total int) {
 				j.mu.Lock()
 				j.Stage = stageNames[stage]
@@ -130,16 +170,86 @@ func (s *server) worker() {
 			onPreview)
 
 		j.mu.Lock()
-		j.image = nil
 		if err != nil {
+			j.image = nil
+			j.source = nil
 			j.State = "error"
 			j.Error = err.Error()
 		} else {
-			j.State = "done"
 			j.mesh = mesh
+			j.Stage = "saving generation"
+			j.Step, j.Total = 0, 0
 		}
 		j.mu.Unlock()
+
+		s.mu.Lock()
+		s.active = false
+		s.mu.Unlock()
+		if s.unloadModelsIfIdle(func() {
+			j.mu.Lock()
+			j.Stage = "freeing VRAM"
+			j.Step, j.Total = 0, 0
+			j.mu.Unlock()
+		}) {
+			log.Printf("models unloaded while idle")
+		}
+
+		if err == nil {
+			j.mu.Lock()
+			j.Stage = "saving generation"
+			j.mu.Unlock()
+			if saveErr := s.persistJob(j); saveErr != nil {
+				// The result remains usable for this process. A persistence failure is
+				// operational, not a reason to discard an otherwise valid generation.
+				log.Printf("persist job %s: %v", j.ID, saveErr)
+			}
+			j.mu.Lock()
+			// If persistence failed or is disabled, keep the bytes in memory so
+			// source display and regeneration remain available for this process.
+			if j.inputPath != "" {
+				j.image = nil
+			}
+			if j.sourcePath != "" {
+				j.source = nil
+			}
+			j.mu.Unlock()
+		}
+
+		j.mu.Lock()
+		if err == nil {
+			j.State = "done"
+		}
+		j.Stage = ""
+		j.Step, j.Total = 0, 0
+		j.mu.Unlock()
 	}
+}
+
+// unloadModelsIfIdle rechecks idleness while holding lifecycle, so a generation
+// cannot be accepted in the gap between the check and freeing the pipeline.
+func (s *server) unloadModelsIfIdle(before func()) bool {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	s.mu.Lock()
+	idle := s.unloadIdle && !s.active && s.queued == 0
+	s.mu.Unlock()
+	if !idle {
+		return false
+	}
+	if before != nil {
+		before()
+	}
+	return s.eng.Unload()
+}
+
+func (s *server) setUnloadIdle(enabled bool) bool {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	s.mu.Lock()
+	s.unloadIdle = enabled
+	idle := !s.active && s.queued == 0
+	s.mu.Unlock()
+	return enabled && idle && s.eng.Unload()
 }
 
 func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
@@ -152,69 +262,209 @@ func (s *server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad multipart form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 	file, _, err := r.FormFile("image")
 	if err != nil {
 		http.Error(w, "missing image field", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
-	img, err := io.ReadAll(file)
-	if err != nil || len(img) == 0 {
+	img, err := readImage(file)
+	if err != nil {
+		http.Error(w, "invalid image: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(img) == 0 {
 		http.Error(w, "empty image", http.StatusBadRequest)
 		return
 	}
 
+	// Browsers send the untouched selected File separately from the PNG they
+	// prepared for inference. API clients that only send `image` still retain
+	// that image as their original source.
+	source := img
+	if sourceFile, _, sourceErr := r.FormFile("source"); sourceErr == nil {
+		defer sourceFile.Close()
+		source, err = readImage(sourceFile)
+		if err != nil || len(source) == 0 {
+			if err == nil {
+				err = fmt.Errorf("empty image")
+			}
+			http.Error(w, "invalid source image: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else if sourceErr != http.ErrMissingFile {
+		http.Error(w, "invalid source image: "+sourceErr.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// quality: "coarse" | "512" | "1024" (default auto → best available)
-	pt := pipeAuto
-	switch r.FormValue("quality") {
-	case "coarse":
-		pt = pipeCoarse
-	case "512":
-		pt = pipe512
-	case "1024":
-		pt = pipe1024
+	pt := pipelineForQuality(r.FormValue("quality"))
+
+	// Browser uploads are already cleaned so they pass "keep" to prevent a
+	// second heuristic pass. Other API clients get automatic cleanup by default.
+	background := backgroundAuto
+	switch r.FormValue("background") {
+	case "keep":
+		background = backgroundKeep
+	case "black":
+		background = backgroundBlack
+	case "white":
+		background = backgroundWhite
 	}
 
 	j := &job{
-		ID:          fmt.Sprintf("%08x", rand.Uint32()),
-		State:       "queued",
-		image:       img,
-		pipeline:    pt,
-		seed:        formUint(r, "seed", rand.Uint64()%1_000_000),
-		steps:       int(formUint(r, "steps", 12)),
-		guidance:    formFloat(r, "guidance", 7.5),
-		wantPreview: r.FormValue("preview") != "0", // live 3D previews unless opted out
-		keyframes:   int(formUint(r, "keyframes", 0)),
+		ID:           fmt.Sprintf("%016x", rand.Uint64()),
+		State:        "queued",
+		CreatedAt:    time.Now().UnixMilli(),
+		Quality:      r.FormValue("quality"),
+		Thumbnail:    r.FormValue("thumbnail"),
+		image:        img,
+		source:       source,
+		pipeline:     pt,
+		background:   background,
+		seed:         formUint(r, "seed", rand.Uint64()%1_000_000),
+		steps:        int(formUint(r, "steps", 12)),
+		textureSteps: int(formUint(r, "texture_steps", 12)),
+		guidance:     formFloat(r, "guidance", 7.5),
+		wantPreview:  r.FormValue("preview") != "0", // live 3D previews unless opted out
+		keyframes:    int(formUint(r, "keyframes", 0)),
+	}
+	s.normaliseJob(j)
+	s.enqueueJob(w, j)
+}
+
+func readImage(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxImage+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxImage {
+		return nil, fmt.Errorf("image exceeds %d MiB", maxImage>>20)
+	}
+	return data, nil
+}
+
+func pipelineForQuality(quality string) int {
+	switch quality {
+	case "coarse":
+		return pipeCoarse
+	case "512":
+		return pipe512
+	case "1024":
+		return pipe1024
+	default:
+		return pipeAuto
+	}
+}
+
+func (s *server) normaliseJob(j *job) {
+	if len(j.Thumbnail) > 256<<10 ||
+		(j.Thumbnail != "" && !strings.HasPrefix(j.Thumbnail, "data:image/jpeg;base64,")) {
+		j.Thumbnail = ""
 	}
 	if j.steps < 1 || j.steps > 50 {
 		j.steps = 12
 	}
+	if j.textureSteps < 1 || j.textureSteps > 50 {
+		j.textureSteps = 12
+	}
 	if j.guidance < 0 || j.guidance > 20 {
 		j.guidance = 7.5
 	}
-	// keyframes cost extra decodes and are only meaningful with previews on
 	if j.keyframes > 8 {
 		j.keyframes = 8
 	}
 	if j.keyframes < 0 || !j.wantPreview {
 		j.keyframes = 0
 	}
+}
 
+func (s *server) enqueueJob(w http.ResponseWriter, j *job) bool {
+	s.lifecycle.Lock()
 	s.mu.Lock()
-	s.jobs[j.ID] = j
-	s.mu.Unlock()
-
 	select {
 	case s.q <- j:
-	default:
-		s.mu.Lock()
-		delete(s.jobs, j.ID)
+		s.jobs[j.ID] = j
+		s.queued++
 		s.mu.Unlock()
+		s.lifecycle.Unlock()
+		writeJSON(w, map[string]string{"job": j.ID})
+		return true
+	default:
+		s.mu.Unlock()
+		s.lifecycle.Unlock()
 		http.Error(w, "queue full, try again later", http.StatusServiceUnavailable)
+		return false
+	}
+}
+
+// handleRegenerate creates a new job from the immutable, processed input saved
+// with a completed generation. No image bytes need to cross the network again.
+func (s *server) handleRegenerate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	old := s.getJob(r, "/api/regenerate/")
+	if old == nil {
+		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
 
-	writeJSON(w, map[string]string{"job": j.ID})
+	old.mu.Lock()
+	state := old.State
+	input := append([]byte(nil), old.image...)
+	source := append([]byte(nil), old.source...)
+	inputPath, sourcePath := old.inputPath, old.sourcePath
+	quality, thumbnail := old.Quality, old.Thumbnail
+	seed, steps := old.seed, old.steps
+	textureSteps, guidance := old.textureSteps, old.guidance
+	old.mu.Unlock()
+	if state != "done" {
+		http.Error(w, "generation is not complete", http.StatusConflict)
+		return
+	}
+	// source.img was the processed input in the first persistence format. That
+	// makes legacy saved jobs regeneratable even though their exact original can
+	// no longer be recovered retroactively.
+	if inputPath == "" {
+		inputPath = sourcePath
+	}
+	var err error
+	if len(input) == 0 && inputPath != "" {
+		input, err = os.ReadFile(inputPath)
+	}
+	if err != nil || len(input) == 0 {
+		http.Error(w, "saved generation input is unavailable", http.StatusConflict)
+		return
+	}
+	if len(source) == 0 && sourcePath != "" {
+		source, err = os.ReadFile(sourcePath)
+		if err != nil {
+			source = nil
+		}
+	}
+	if len(source) == 0 {
+		source = append([]byte(nil), input...)
+	}
+
+	if requested := r.FormValue("quality"); requested != "" {
+		quality = requested
+	}
+	j := &job{
+		ID: fmt.Sprintf("%016x", rand.Uint64()), State: "queued",
+		CreatedAt: time.Now().UnixMilli(), Quality: quality, Thumbnail: thumbnail,
+		image: input, source: source, pipeline: pipelineForQuality(quality),
+		background: backgroundKeep,
+		seed:       formUint(r, "seed", seed), steps: int(formUint(r, "steps", uint64(steps))),
+		textureSteps: int(formUint(r, "texture_steps", uint64(textureSteps))),
+		guidance:     formFloat(r, "guidance", guidance),
+		wantPreview:  r.FormValue("preview") != "0",
+		keyframes:    int(formUint(r, "keyframes", 0)),
+	}
+	s.normaliseJob(j)
+	s.enqueueJob(w, j)
 }
 
 func (s *server) getJob(r *http.Request, prefix string) *job {
@@ -230,9 +480,127 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
+	if r.Method == http.MethodDelete {
+		j.mu.Lock()
+		state, dir := j.State, j.persistDir
+		j.mu.Unlock()
+		if state != "done" && state != "error" {
+			http.Error(w, "generation is still active", http.StatusConflict)
+			return
+		}
+		if dir != "" {
+			if err := os.RemoveAll(dir); err != nil {
+				http.Error(w, "delete persisted generation: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		s.mu.Lock()
+		delete(s.jobs, j.ID)
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET or DELETE only", http.StatusMethodNotAllowed)
+		return
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	writeJSON(w, j)
+}
+
+// handleSource serves the original upload, retained byte-for-byte for the
+// full-screen showcase and other future use outside the inference pipeline.
+func (s *server) handleSource(w http.ResponseWriter, r *http.Request) {
+	j := s.getJob(r, "/api/source/")
+	if j == nil {
+		http.Error(w, "no such job", http.StatusNotFound)
+		return
+	}
+	j.mu.Lock()
+	image := j.source
+	if len(image) == 0 {
+		image = j.image // compatibility for an in-memory job from an older server
+	}
+	path := j.sourcePath
+	j.mu.Unlock()
+	if len(image) > 0 {
+		w.Header().Set("Content-Type", http.DetectContentType(image))
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Write(image)
+		return
+	}
+	if path == "" {
+		http.Error(w, "source image was not retained for this generation", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	http.ServeFile(w, r, path)
+}
+
+type jobSummary struct {
+	ID            string `json:"id"`
+	CreatedAt     int64  `json:"createdAt"`
+	Quality       string `json:"quality,omitempty"`
+	Thumbnail     string `json:"thumbnail,omitempty"`
+	PreviewSeq    int    `json:"previewSeq"`
+	Source        bool   `json:"sourceAvailable"`
+	Regeneratable bool   `json:"regeneratable"`
+}
+
+func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	jobs := make([]*job, 0, len(s.jobs))
+	for _, j := range s.jobs {
+		jobs = append(jobs, j)
+	}
+	s.mu.Unlock()
+
+	if r.Method == http.MethodDelete {
+		deleted := 0
+		for _, j := range jobs {
+			j.mu.Lock()
+			state, dir := j.State, j.persistDir
+			j.mu.Unlock()
+			if state != "done" && state != "error" {
+				continue
+			}
+			if dir != "" {
+				if err := os.RemoveAll(dir); err != nil {
+					http.Error(w, "delete persisted generation: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+			s.mu.Lock()
+			if s.jobs[j.ID] == j {
+				delete(s.jobs, j.ID)
+				deleted++
+			}
+			s.mu.Unlock()
+		}
+		writeJSON(w, map[string]int{"deleted": deleted})
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET or DELETE only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	out := make([]jobSummary, 0, len(jobs))
+	for _, j := range jobs {
+		j.mu.Lock()
+		if j.State == "done" {
+			out = append(out, jobSummary{
+				ID: j.ID, CreatedAt: j.CreatedAt, Quality: j.Quality,
+				Thumbnail: j.Thumbnail, PreviewSeq: j.PreviewSeq,
+				Source:        len(j.source) > 0 || j.sourcePath != "",
+				Regeneratable: len(j.image) > 0 || j.inputPath != "" || j.sourcePath != "",
+			})
+		}
+		j.mu.Unlock()
+	}
+	sort.Slice(out, func(i, k int) bool { return out[i].CreatedAt > out[k].CreatedAt })
+	writeJSON(w, out)
 }
 
 func (s *server) handleMesh(w http.ResponseWriter, r *http.Request) {
@@ -241,34 +609,129 @@ func (s *server) handleMesh(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
-	j.mu.Lock()
-	mesh := j.mesh
-	j.mu.Unlock()
-	if mesh == nil {
-		http.Error(w, "mesh not ready", http.StatusConflict)
+	mesh, err := s.loadJobMesh(j)
+	if err != nil {
+		http.Error(w, "mesh not ready: "+err.Error(), http.StatusConflict)
 		return
 	}
+	writeMesh(w, mesh)
+}
 
-	// Wire format. T2MESH01: verts, normals, tris. T2MESH02 (textured): also a
-	// per-vertex PBR block (5 floats: base_color rgb, metallic, roughness) after
-	// the normals, before the tris.
-	//   magic[8] u32 nv u32 nt  f32[3nv] verts  f32[3nv] normals
-	//   [T2MESH02: f32[5nv] pbr]  i32[3nt] tris
+// writeMesh emits T2MESH01 geometry or T2MESH03 geometry followed by six-float
+// PBR attributes. It is shared by generated and component-cleanup preview meshes.
+func writeMesh(w http.ResponseWriter, mesh *meshData) {
 	w.Header().Set("Content-Type", "application/octet-stream")
-	textured := len(mesh.PBR) == 5*mesh.NVerts
+	if err := writeMeshBinary(w, mesh); err != nil {
+		log.Printf("write mesh response: %v", err)
+	}
+}
+
+func writeMeshBinary(w io.Writer, mesh *meshData) error {
+	textured := len(mesh.PBR) == 6*mesh.NVerts
 	if textured {
-		w.Write([]byte("T2MESH02"))
+		if _, err := w.Write([]byte("T2MESH03")); err != nil {
+			return err
+		}
 	} else {
-		w.Write([]byte("T2MESH01"))
+		if _, err := w.Write([]byte("T2MESH01")); err != nil {
+			return err
+		}
 	}
-	binary.Write(w, binary.LittleEndian, uint32(mesh.NVerts))
-	binary.Write(w, binary.LittleEndian, uint32(mesh.NTris))
-	binary.Write(w, binary.LittleEndian, mesh.Verts)
-	binary.Write(w, binary.LittleEndian, mesh.Normals)
+	if err := binary.Write(w, binary.LittleEndian, uint32(mesh.NVerts)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(mesh.NTris)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, mesh.Verts); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, mesh.Normals); err != nil {
+		return err
+	}
 	if textured {
-		binary.Write(w, binary.LittleEndian, mesh.PBR)
+		if err := binary.Write(w, binary.LittleEndian, mesh.PBR); err != nil {
+			return err
+		}
 	}
-	binary.Write(w, binary.LittleEndian, mesh.Tris)
+	return binary.Write(w, binary.LittleEndian, mesh.Tris)
+}
+
+type exportOptions struct {
+	textureSize     int
+	componentFilter int
+}
+
+func parseExportOptions(r *http.Request) exportOptions {
+	o := exportOptions{
+		textureSize:     2048,
+		componentFilter: 2, // safe default: preserve every connected component
+	}
+	if n := int(formUint(r, "tex", uint64(o.textureSize))); n >= 256 && n <= 4096 {
+		o.textureSize = n
+	}
+	switch r.FormValue("components") {
+	case "tiny":
+		o.componentFilter = 0
+	case "largest":
+		o.componentFilter = 1
+	}
+	return o
+}
+
+func (o exportOptions) prepareKey() string {
+	return strconv.Itoa(o.componentFilter)
+}
+
+func (o exportOptions) glbKey() string {
+	return fmt.Sprintf("%d-%s", o.textureSize, o.prepareKey())
+}
+
+func (s *server) preparedExportMesh(j *job, o exportOptions) (*meshData, error) {
+	// Keep-all preview is the saved source object itself: no copying, normal
+	// recomputation, topology cleanup, or other opportunity to alter it.
+	if o.componentFilter == 2 {
+		return s.loadJobMesh(j)
+	}
+	key := o.prepareKey()
+	j.mu.Lock()
+	if j.exportKey == key && j.exportMesh != nil {
+		mesh := j.exportMesh
+		j.mu.Unlock()
+		return mesh, nil
+	}
+	j.mu.Unlock()
+	source, err := s.loadJobMesh(j)
+	if err != nil {
+		return nil, err
+	}
+	mesh, err := s.eng.PrepareMesh(source, o.componentFilter)
+	if err != nil {
+		return nil, err
+	}
+	j.mu.Lock()
+	j.exportMesh, j.exportKey = mesh, key
+	// A restored source can always be re-read. Avoid pinning duplicate full-size
+	// source and component-cleanup meshes in server memory.
+	if j.persistDir != "" {
+		j.mesh = nil
+	}
+	j.mu.Unlock()
+	return mesh, nil
+}
+
+func (s *server) handleExportPreview(w http.ResponseWriter, r *http.Request) {
+	j := s.getJob(r, "/api/export-preview/")
+	if j == nil {
+		http.Error(w, "no such job", http.StatusNotFound)
+		return
+	}
+	mesh, err := s.preparedExportMesh(j, parseExportOptions(r))
+	if err != nil {
+		http.Error(w, "prepare export: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeMesh(w, mesh)
 }
 
 // handlePreview streams a recorded intermediate-preview frame for a job. With
@@ -283,16 +746,17 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.mu.Lock()
-	var blob []byte
+	seq := -1
 	if q := r.URL.Query().Get("seq"); q != "" {
-		if i, err := strconv.Atoi(q); err == nil && i >= 0 && i < len(j.previews) {
-			blob = j.previews[i]
+		if i, err := strconv.Atoi(q); err == nil {
+			seq = i
 		}
-	} else if n := len(j.previews); n > 0 {
-		blob = j.previews[n-1]
+	} else if j.PreviewSeq > 0 {
+		seq = j.PreviewSeq - 1
 	}
 	j.mu.Unlock()
-	if blob == nil {
+	blob, err := loadJobPreview(j, seq)
+	if err != nil {
 		http.Error(w, "no such preview frame", http.StatusConflict)
 		return
 	}
@@ -300,40 +764,28 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	w.Write(blob)
 }
 
-// handleGLB bakes the mesh into a UV-atlas-textured GLB on demand and streams
-// it as a download. Result is cached per (tex,tris) on the job so re-requests
-// are free. Baking is CPU-bound and can take a few seconds for the dense mesh.
+// handleGLB writes the exact prepared preview mesh into a vertex-coloured GLB.
+// Both prepared geometry and final GLB are cached by their export settings.
 func (s *server) handleGLB(w http.ResponseWriter, r *http.Request) {
 	j := s.getJob(r, "/api/glb/")
 	if j == nil {
 		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
-	j.mu.Lock()
-	mesh := j.mesh
-	j.mu.Unlock()
-	if mesh == nil {
-		http.Error(w, "mesh not ready", http.StatusConflict)
+	o := parseExportOptions(r)
+	mesh, err := s.preparedExportMesh(j, o)
+	if err != nil {
+		http.Error(w, "prepare export: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	tex := int(formUint(r, "tex", 2048))
-	tris := int(formUint(r, "tris", 150000))
-	if tex < 256 || tex > 4096 {
-		tex = 2048
-	}
-	if tris < 1000 || tris > 4000000 {
-		tris = 150000
-	}
-	key := fmt.Sprintf("%d-%d", tex, tris)
+	key := o.glbKey()
 
 	j.mu.Lock()
 	glb, cached := j.glb, j.glbKey == key && j.glb != nil
 	j.mu.Unlock()
 
 	if !cached {
-		var err error
-		glb, err = s.eng.BakeGLB(mesh, tex, tris)
+		glb, err = s.eng.BakeGLB(mesh, o.textureSize, 2 /*already prepared*/)
 		if err != nil {
 			http.Error(w, "bake glb: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -348,30 +800,60 @@ func (s *server) handleGLB(w http.ResponseWriter, r *http.Request) {
 	w.Write(glb)
 }
 
-func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
+func (s *server) info() map[string]interface{} {
+	backend, caps, textured, loaded := s.eng.Info()
 	qualities := []string{"coarse"}
-	if s.eng.caps&cap512 != 0 {
+	if caps&cap512 != 0 {
 		qualities = append(qualities, "512")
 	}
-	if s.eng.caps&cap1024 != 0 {
+	if caps&cap1024 != 0 {
 		qualities = append(qualities, "1024")
 	}
 	best := "coarse"
-	if s.eng.caps&cap1024 != 0 {
+	if caps&cap1024 != 0 {
 		best = "1024"
-	} else if s.eng.caps&cap512 != 0 {
+	} else if caps&cap512 != 0 {
 		best = "512"
 	}
-	writeJSON(w, map[string]interface{}{
-		"backend":   s.eng.backend,
-		"qualities": qualities,
-		"best":      best,
-		"textured":  s.eng.textured,
+	s.mu.Lock()
+	unloadIdle := s.unloadIdle
+	generationActive := s.active || s.queued > 0
+	s.mu.Unlock()
+	return map[string]interface{}{
+		"backend":           backend,
+		"qualities":         qualities,
+		"best":              best,
+		"textured":          textured,
+		"models_loaded":     loaded,
+		"unload_idle":       unloadIdle,
+		"generation_active": generationActive,
 		"defaults": map[string]interface{}{
-			"steps":    12,
-			"guidance": 7.5,
+			"steps":         12,
+			"guidance":      7.5,
+			"texture_steps": 12,
 		},
-	})
+	}
+}
+
+func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.info())
+}
+
+func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	v := r.FormValue("unload_idle")
+	enabled := v == "1" || v == "true" || v == "on"
+	if s.setUnloadIdle(enabled) {
+		log.Printf("models unloaded while idle")
+	}
+	writeJSON(w, s.info())
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
@@ -411,7 +893,7 @@ func main() {
 	slat := flag.String("slat", "", "512 shape-slat flow gguf (default <ggufs>/slat_flow_f16.gguf)")
 	slatHR := flag.String("slat-hr", "", "1024 shape-slat flow gguf (default <ggufs>/slat_flow_1024_f16.gguf)")
 	shapeDec := flag.String("shape-dec", "", "shape decoder gguf (default <ggufs>/shape_dec_f16.gguf)")
-	shapeEnc := flag.String("shape-enc", "", "shape encoder gguf (default <ggufs>/shape_enc_f16.gguf)")
+	shapeEnc := flag.String("shape-enc", "", "deprecated: integrated texturing no longer needs a shape encoder")
 	texDec := flag.String("tex-dec", "", "texture decoder gguf (default <ggufs>/tex_dec_f16.gguf)")
 	texSlat := flag.String("tex-slat", "", "512 texture-slat flow gguf (default <ggufs>/tex_slat_flow_512_f16.gguf)")
 	texSlatHR := flag.String("tex-slat-hr", "", "1024 texture-slat flow gguf (default <ggufs>/tex_slat_flow_1024_f16.gguf)")
@@ -419,6 +901,8 @@ func main() {
 	no1024 := flag.Bool("no-1024", false, "disable the 1024 cascade (512 fine max)")
 	noTexture := flag.Bool("no-texture", false, "disable PBR texturing (geometry only)")
 	addr := flag.String("addr", ":8742", "listen address")
+	storeDir := flag.String("store", "../generations", "durable completed-generation directory (empty disables persistence)")
+	unloadIdle := flag.Bool("unload-idle", false, "start with models unloaded and release them after each idle generation")
 	flag.Parse()
 
 	// Recorded previews: capture one voxel frame per SS step (finer than the
@@ -453,14 +937,19 @@ func main() {
 					slatHRPath = ""
 				}
 			}
-			// PBR texturing needs the shape encoder, tex decoder, and 512 tex flow.
+			// Integrated PBR texturing uses the generated shape latent directly and
+			// therefore needs only the texture decoder and texture flow.
 			if !*noTexture {
-				shapeEncPath = pick(*shapeEnc, "shape_enc_f16.gguf")
+				shapeEncPath = *shapeEnc // accepted for older invocations; ignored by ABI 6
 				texDecPath = pick(*texDec, "tex_dec_f16.gguf")
 				texSlatPath = pick(*texSlat, "tex_slat_flow_512_f16.gguf")
-				if fileExists(shapeEncPath) && fileExists(texDecPath) && fileExists(texSlatPath) {
+				if fileExists(texDecPath) && fileExists(texSlatPath) {
 					texSlatHRPath = pick(*texSlatHR, "tex_slat_flow_1024_f16.gguf")
 					if !fileExists(texSlatHRPath) {
+						if slatHRPath != "" {
+							log.Printf("1024 texture model not found, using complete 512 textured pipeline")
+							slatHRPath = ""
+						}
 						texSlatHRPath = ""
 					}
 				} else {
@@ -474,19 +963,33 @@ func main() {
 	eng, err := newEngine(*libPath, pick(*dino, "dino_f16.gguf"),
 		pick(*flow, "ss_flow_f16.gguf"), pick(*dec, "ss_dec_f16.gguf"),
 		slatPath, slatHRPath, shapePath,
-		shapeEncPath, texDecPath, texSlatPath, texSlatHRPath)
+		shapeEncPath, texDecPath, texSlatPath, texSlatHRPath, *unloadIdle)
 	if err != nil {
 		log.Fatal(err)
 	}
+	backend, caps, _, loaded := eng.Info()
 	mode := "coarse (marching cubes)"
-	if eng.caps&cap1024 != 0 {
+	if caps&cap1024 != 0 {
 		mode = "1024 cascade (+ 512 fine, coarse)"
-	} else if eng.caps&cap512 != 0 {
+	} else if caps&cap512 != 0 {
 		mode = "512 fine (+ coarse)"
 	}
-	log.Printf("models loaded, backend: %s, qualities: %s", eng.backend, mode)
+	if loaded {
+		log.Printf("models loaded, backend: %s, qualities: %s", backend, mode)
+	} else {
+		log.Printf("models configured for lazy load, backend: %s, qualities: %s", backend, mode)
+	}
 
-	s := &server{eng: eng, jobs: map[string]*job{}, q: make(chan *job, 8)}
+	s := &server{
+		eng: eng, jobs: map[string]*job{}, q: make(chan *job, 8),
+		storeDir: *storeDir, unloadIdle: *unloadIdle,
+	}
+	restored, restoreErr := s.restoreJobs()
+	if restoreErr != nil {
+		log.Printf("job persistence disabled: %v", restoreErr)
+	} else if restored > 0 {
+		log.Printf("restored %d completed generation(s) from %s", restored, *storeDir)
+	}
 	go s.worker()
 
 	web, err := fs.Sub(webFS, "web")
@@ -495,11 +998,28 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	indexPage, err := fs.ReadFile(web, "index.html")
+	if err != nil {
+		log.Fatal(err)
+	}
+	mux.HandleFunc("/showcase", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/showcase" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(indexPage)
+	})
 	mux.Handle("/", http.FileServer(http.FS(web)))
 	mux.HandleFunc("/api/info", s.handleInfo)
+	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/generate", s.handleGenerate)
+	mux.HandleFunc("/api/regenerate/", s.handleRegenerate)
+	mux.HandleFunc("/api/jobs", s.handleJobs)
 	mux.HandleFunc("/api/job/", s.handleJob)
+	mux.HandleFunc("/api/source/", s.handleSource)
 	mux.HandleFunc("/api/mesh/", s.handleMesh)
+	mux.HandleFunc("/api/export-preview/", s.handleExportPreview)
 	mux.HandleFunc("/api/preview/", s.handlePreview)
 	mux.HandleFunc("/api/glb/", s.handleGLB)
 

@@ -1,15 +1,12 @@
 // Encode an image into the TRELLIS.2 DINOv3 conditioning tensor (.dinodata),
 // replacing the external dump_dinodata.py:
 //
-//   image (PNG/JPG, ideally RGBA with a transparent background)
-//     -> preprocess (alpha bbox crop, premultiply, LANCZOS 512)
+//   image (PNG/JPG; solid black/white backgrounds are removed automatically)
+//     -> background cleanup -> alpha bbox crop, premultiply, LANCZOS 512
 //     -> DINOv3 ViT-L/16 -> [1, 1029, 1024] cond -> .dinodata
 //
 // usage: dino_encode <dino.gguf> <image> [out.dinodata] [--size N] [--pre out.png]
 //
-// Images without an alpha channel are used as-is (background removal is not
-// ported); results are best with a subject on a transparent background.
-
 #include "trellis2.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -51,33 +48,17 @@ int main(int argc, char ** argv) {
                      img_path.c_str(), stbi_failure_reason());
         return 1;
     }
-    std::printf("image  : %s  %dx%d (%d channels%s)\n", img_path.c_str(), w, h, comp,
-                comp < 4 ? ", no alpha -> used as-is" : "");
+    const int removed = trellis2_remove_solid_background_rgba(
+        pixels, w, h, TRELLIS2_BACKGROUND_AUTO);
+    std::printf("image  : %s  %dx%d (%d channels, background pixels changed: %d)\n",
+                img_path.c_str(), w, h, comp, removed);
 
     std::string err;
     std::vector<uint8_t> rgb;
-    if (comp == 4) {
-        if (!trellis2_preprocess_rgba(pixels, w, h, size, rgb, &err)) {
-            std::fprintf(stderr, "preprocess failed: %s\n", err.c_str());
-            stbi_image_free(pixels);
-            return 1;
-        }
-    } else {
-        // No meaningful alpha: skip crop/premultiply, just LANCZOS-resize.
-        // Reuse the preprocessing entry point by making every pixel opaque
-        // subject pixels (alpha=255): crop becomes the full image square.
-        std::vector<uint8_t> rgba((size_t) w * h * 4);
-        for (size_t i = 0; i < (size_t) w * h; ++i) {
-            rgba[i * 4 + 0] = pixels[i * 4 + 0];
-            rgba[i * 4 + 1] = pixels[i * 4 + 1];
-            rgba[i * 4 + 2] = pixels[i * 4 + 2];
-            rgba[i * 4 + 3] = 255;
-        }
-        if (!trellis2_preprocess_rgba(rgba.data(), w, h, size, rgb, &err)) {
-            std::fprintf(stderr, "preprocess failed: %s\n", err.c_str());
-            stbi_image_free(pixels);
-            return 1;
-        }
+    if (!trellis2_preprocess_rgba(pixels, w, h, size, rgb, &err)) {
+        std::fprintf(stderr, "preprocess failed: %s\n", err.c_str());
+        stbi_image_free(pixels);
+        return 1;
     }
     stbi_image_free(pixels);
 

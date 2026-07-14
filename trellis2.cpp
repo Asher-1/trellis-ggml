@@ -1640,6 +1640,113 @@ inline int py_round_half_even(double v) {
 
 } // namespace
 
+int trellis2_remove_solid_background_rgba(uint8_t * rgba, int w, int h, int mode) {
+    if (!rgba || w <= 0 || h <= 0 ||
+        mode < TRELLIS2_BACKGROUND_AUTO || mode > TRELLIS2_BACKGROUND_WHITE) {
+        return -1;
+    }
+    if (mode == TRELLIS2_BACKGROUND_KEEP) return 0;
+
+    const size_t count = (size_t) w * h;
+    if (mode == TRELLIS2_BACKGROUND_AUTO) {
+        // An already-masked PNG should be trusted. Requiring more than both 1%
+        // and four pixels avoids treating a stray transparent metadata pixel as
+        // a meaningful subject mask.
+        size_t translucent = 0;
+        for (size_t i = 0; i < count; ++i) translucent += rgba[i * 4 + 3] < 250;
+        if (translucent > std::max<size_t>(4, count / 100)) return 0;
+
+        int border = 0, dark = 0, light = 0;
+        auto sample = [&](int x, int y) {
+            const uint8_t * p = rgba + ((size_t) y * w + x) * 4;
+            const int lo = std::min((int) p[0], std::min((int) p[1], (int) p[2]));
+            const int hi = std::max((int) p[0], std::max((int) p[1], (int) p[2]));
+            ++border;
+            dark  += hi <= 80;
+            light += lo >= 175;
+        };
+        for (int x = 0; x < w; ++x) {
+            sample(x, 0);
+            if (h > 1) sample(x, h - 1);
+        }
+        for (int y = 1; y + 1 < h; ++y) {
+            sample(0, y);
+            if (w > 1) sample(w - 1, y);
+        }
+        int dark_corners = 0, light_corners = 0;
+        const int corners[4][2] = {{0, 0}, {w - 1, 0}, {0, h - 1}, {w - 1, h - 1}};
+        for (const auto & c : corners) {
+            const uint8_t * p = rgba + ((size_t) c[1] * w + c[0]) * 4;
+            const int lo = std::min((int) p[0], std::min((int) p[1], (int) p[2]));
+            const int hi = std::max((int) p[0], std::max((int) p[1], (int) p[2]));
+            dark_corners += hi <= 80;
+            light_corners += lo >= 175;
+        }
+        const bool is_dark = dark * 100 >= border * 55 || dark_corners >= 3;
+        const bool is_light = light * 100 >= border * 55 || light_corners >= 3;
+        if (!is_dark && !is_light) return 0;
+        mode = is_dark && (!is_light || dark >= light)
+             ? TRELLIS2_BACKGROUND_BLACK : TRELLIS2_BACKGROUND_WHITE;
+    }
+
+    auto distance = [&](size_t i) {
+        const uint8_t * p = rgba + i * 4;
+        if (mode == TRELLIS2_BACKGROUND_BLACK) {
+            return std::max((int) p[0], std::max((int) p[1], (int) p[2]));
+        }
+        const int lo = std::min((int) p[0], std::min((int) p[1], (int) p[2]));
+        return 255 - lo;
+    };
+    auto eligible = [&](size_t i) { return distance(i) <= 80; };
+
+    std::vector<uint8_t> seen(count, 0);
+    std::vector<size_t> queue;
+    queue.reserve(std::min<size_t>(count, (size_t) 1 << 20));
+    auto seed = [&](int x, int y) {
+        const size_t i = (size_t) y * w + x;
+        if (!seen[i] && eligible(i)) {
+            seen[i] = 1;
+            queue.push_back(i);
+        }
+    };
+    for (int x = 0; x < w; ++x) {
+        seed(x, 0);
+        if (h > 1) seed(x, h - 1);
+    }
+    for (int y = 1; y + 1 < h; ++y) {
+        seed(0, y);
+        if (w > 1) seed(w - 1, y);
+    }
+
+    int changed = 0;
+    for (size_t head = 0; head < queue.size(); ++head) {
+        const size_t i = queue[head];
+        const int d = distance(i);
+        float t = (float) (d - 12) / (72.0f - 12.0f);
+        t = std::max(0.0f, std::min(1.0f, t));
+        t = t * t * (3.0f - 2.0f * t); // smooth feather, background -> subject
+        uint8_t * p = rgba + i * 4;
+        const uint8_t a = (uint8_t) std::lround((float) p[3] * t);
+        if (a != p[3]) {
+            p[3] = a;
+            ++changed;
+        }
+
+        const int x = (int) (i % (size_t) w), y = (int) (i / (size_t) w);
+        auto visit = [&](size_t n) {
+            if (!seen[n] && eligible(n)) {
+                seen[n] = 1;
+                queue.push_back(n);
+            }
+        };
+        if (x > 0) visit(i - 1);
+        if (x + 1 < w) visit(i + 1);
+        if (y > 0) visit(i - (size_t) w);
+        if (y + 1 < h) visit(i + (size_t) w);
+    }
+    return changed;
+}
+
 bool trellis2_preprocess_rgba(const uint8_t * rgba, int w, int h,
                               int out_size, std::vector<uint8_t> & out_rgb,
                               std::string * error) {
@@ -2488,6 +2595,7 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
                           const float * slat, int n_voxels, const int32_t * coords_in,
                           int upsample_times,
                           const std::vector<trellis2_subdiv_level> * guide,
+                          std::vector<trellis2_subdiv_level> * predicted_subs,
                           bool pbr_scale,
                           std::vector<float> & out_feats,
                           std::vector<int32_t> & out_coords,
@@ -2496,7 +2604,8 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
     if (!m)           { set_error(error, "null model"); return false; }
     if (!m->has_data) { set_error(error, "model loaded metadata-only; reload with load_tensors=true"); return false; }
     // Texture decoder (pred_subdiv=False): the per-level subdivision is supplied
-    // by the shape encoder (`guide`) instead of predicted by a to_subdiv head.
+    // by the integrated shape decoder or standalone shape encoder (`guide`)
+    // instead of predicted by a to_subdiv head.
     if (guide && (int) guide->size() < m->hp.n_levels - 1) {
         set_error(error, "guide subdivisions shorter than n_levels-1"); return false;
     }
@@ -2510,6 +2619,7 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
         set_error(error, "upsample_times out of range [1, n_levels-1]");
         return false;
     }
+    if (predicted_subs) predicted_subs->assign((size_t) std::max(0, n_levels - 1), {});
 
     std::string missing;
 
@@ -2795,6 +2905,11 @@ static bool shape_dec_run(trellis2_shape_dec_model * m,
                     }
                 }
             }
+            if (predicted_subs) {
+                trellis2_subdiv_level & sub = (*predicted_subs)[(size_t) lvl];
+                sub.fine_coords = child_coords;
+                sub.cidx = cidx;
+            }
             const int L_child = (int) cidx.size();
             if (L_child == 0) {
                 set_error(error, "no children at level " + std::to_string(lvl));
@@ -2875,7 +2990,19 @@ bool trellis2_shape_dec_decode(trellis2_shape_dec_model * m,
                                trellis2_shape_dec_taps * taps,
                                std::string * error) {
     return shape_dec_run(m, slat, n_voxels, coords_in, /*upsample_times*/ -1,
-                         /*guide*/ nullptr, /*pbr_scale*/ false,
+                         /*guide*/ nullptr, /*predicted_subs*/ nullptr, /*pbr_scale*/ false,
+                         out_feats, out_coords, taps, error);
+}
+
+bool trellis2_shape_dec_decode_with_subs(trellis2_shape_dec_model * m,
+                                         const float * slat, int n_voxels, const int32_t * coords_in,
+                                         std::vector<float> & out_feats,
+                                         std::vector<int32_t> & out_coords,
+                                         std::vector<trellis2_subdiv_level> & out_subs,
+                                         trellis2_shape_dec_taps * taps,
+                                         std::string * error) {
+    return shape_dec_run(m, slat, n_voxels, coords_in, /*upsample_times*/ -1,
+                         /*guide*/ nullptr, &out_subs, /*pbr_scale*/ false,
                          out_feats, out_coords, taps, error);
 }
 
@@ -2886,11 +3013,11 @@ bool trellis2_shape_dec_upsample(trellis2_shape_dec_model * m,
                                  std::string * error) {
     std::vector<float> unused;
     return shape_dec_run(m, slat, n_voxels, coords, upsample_times,
-                         /*guide*/ nullptr, /*pbr_scale*/ false,
+                         /*guide*/ nullptr, /*predicted_subs*/ nullptr, /*pbr_scale*/ false,
                          unused, out_coords, /*taps*/ nullptr, error);
 }
 
-// Texture decoder: the shape-decoder driver with the encoder's subdivision
+// Texture decoder: the shape-decoder driver with the supplied shape subdivision
 // replayed (guide) and the PBR [0,1] output scale.
 bool trellis2_tex_dec_decode(trellis2_shape_dec_model * m,
                              const float * slat, int n_voxels, const int32_t * coords,
@@ -2899,7 +3026,7 @@ bool trellis2_tex_dec_decode(trellis2_shape_dec_model * m,
                              std::vector<int32_t> & out_coords,
                              std::string * error) {
     return shape_dec_run(m, slat, n_voxels, coords, /*upsample_times*/ -1,
-                         &subs, /*pbr_scale*/ true,
+                         &subs, /*predicted_subs*/ nullptr, /*pbr_scale*/ true,
                          out_feats, out_coords, /*taps*/ nullptr, error);
 }
 

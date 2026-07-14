@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a T2MESH02 (per-vertex PBR) binary mesh to a PNG for eyeballing the
+"""Render a T2MESH02/03 (per-vertex PBR) binary mesh to a PNG for eyeballing the
 demo's textured output. Mirrors the viewer's orientation-independent shading."""
 import struct, sys, numpy as np
 from PIL import Image
@@ -10,10 +10,14 @@ magic = b[:8]; nv, nt = struct.unpack("<II", b[8:16]); o = 16
 V = np.frombuffer(b, "<f4", 3*nv, o).reshape(-1, 3).astype(np.float64); o += 12*nv
 o += 12*nv  # skip normals (recompute from faces)
 pbr = None
-if magic == b"T2MESH02":
-    pbr = np.frombuffer(b, "<f4", 5*nv, o).reshape(-1, 5).astype(np.float64); o += 20*nv
+if magic == b"T2MESH03":
+    pbr = np.frombuffer(b, "<f4", 6*nv, o).reshape(-1, 6).astype(np.float64); o += 24*nv
+elif magic == b"T2MESH02":
+    old = np.frombuffer(b, "<f4", 5*nv, o).reshape(-1, 5).astype(np.float64); o += 20*nv
+    pbr = np.concatenate([old, np.ones((nv, 1))], axis=1)
 F = np.frombuffer(b, "<i4", 3*nt, o).reshape(-1, 3)
 C = pbr[:, 0:3] if pbr is not None else np.full((nv, 3), 0.65)
+C_lin = np.clip(C, 0, 1) ** 2.2
 metal = pbr[:, 3] if pbr is not None else np.zeros(nv)
 print(f"{magic} {nv:,} verts  base_color mean {C.mean(0).round(3)}", flush=True)
 
@@ -49,7 +53,7 @@ def render(el, az):
     z = P[:, 2]
     V = np.array([0., 0., 1.])
     nv_ = np.abs(Nr @ V)
-    F0 = 0.04*(1-metal)[:, None] + C*metal[:, None]
+    F0 = 0.04*(1-metal)[:, None] + C_lin*metal[:, None]
     F = F0 + (1-F0)*((1-nv_)[:, None]**5)
     shin = 6.0 + (220.0-6.0)*np.clip(1-rough, 0, 1)**1.5
     sn = (shin+2.0)/(2*np.pi)
@@ -59,7 +63,7 @@ def render(el, az):
         diffuse += Lc[None]*w*ndl[:, None]
         h = l+V; h = h/np.linalg.norm(h); nh = np.abs(Nr @ h)
         specular += Lc[None]*w*(nh[:, None]**shin[:, None])*sn[:, None]*ndl[:, None]
-    albedo = C*(1-metal)[:, None]
+    albedo = C_lin*(1-metal)[:, None]
     hemi = np.abs(N[:, 1])*0.5+0.5
     amb = (1-hemi)[:, None]*np.array([.20, .19, .22]) + hemi[:, None]*np.array([.55, .58, .66])
     col = np.clip(albedo*(amb*0.55 + diffuse*0.75) + specular*F + F*0.25, 0, 1)

@@ -3,8 +3,9 @@
 A C++/[ggml](https://github.com/ggml-org/ggml) implementation of the
 **TRELLIS.2** image-to-3D pipeline: an image goes in, a 3D mesh with per-vertex
 PBR textures comes out, with all inference in C++/ggml (no PyTorch at runtime).
-The demo can also bake the result into a portable, image-textured **GLB** —
-CUDA-free UV atlas + PBR bake, no reference container required.
+The demo can also export the result into a portable, full-density **GLB** with
+standard interpolated vertex colour and retained PBR attributes—no reference
+container required.
 
 Modeled structurally after [sam3.cpp](https://github.com/rms80/sam3.cpp):
 single-file library (`trellis2.h` / `trellis2.cpp`), bundled ggml as a
@@ -27,14 +28,41 @@ docker run --rm -v "$PWD":/work -w /work trellis2-demo bash -c '
         -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_SHARED_LIBS=ON && cmake --build build-cuda-shared -j
   cd server && go build -o trellis2-server-linux .'
 docker run --rm --device nvidia.com/gpu=all -v "$PWD":/work -w /work/server -p 8742:8742 \
-  trellis2-demo ./trellis2-server-linux -lib /work/build-cuda-shared/libtrellis2.so -ggufs /work/ggufs
-# open http://localhost:8742 , drop an image (transparent background works best)
+  trellis2-demo ./trellis2-server-linux -lib /work/build-cuda-shared/libtrellis2.so \
+  -ggufs /work/ggufs -store /work/generations -unload-idle
+# open http://localhost:8742 and drop an image
 ```
 
+Completed generations are committed atomically under `generations/` (final
+mesh, replay frames, and manifest) and restored with the same job IDs after a
+server restart. Pass `-store ''` to disable persistence or `-store PATH` to use
+a different durable location. Incomplete writes are ignored on startup. With
+`-unload-idle`, the HTTP server starts without allocating model VRAM, loads the
+pipeline on the first generation, and releases it again when the queue is idle.
+
 The browser UI has a **quality** selector: coarse preview (64³ marching cubes),
-512³ fine, or **1024³ cascade** (the TRELLIS.2 default — sharpest). Coarse falls
+512³ fine, or **1024³ cascade** (the TRELLIS.2 default and highest resolution
+currently supported here). Upstream's optional 1536 cascade is not yet ported. Coarse falls
 back automatically if the shape-SLAT models are absent (`-coarse`); the 1024
 cascade needs the extra 1024 model (`-no-1024` disables it).
+Enable **free VRAM when idle** to unload the resident model pipeline between
+generations; the next queued generation reloads it automatically.
+The always-visible **asset export** panel preserves the generated polygon count,
+can preview component cleanup, optionally keep only the largest connected piece,
+restore the original preview, and download a Three.js-ready GLB. Dense generated
+materials are stored as standard interpolated vertex colours rather than a
+sub-texel per-triangle atlas; original metallic/roughness values are also retained
+in the custom `_METALLIC_ROUGHNESS` attribute. All components are preserved by
+default; destructive cleanup must be selected explicitly. Showcase mode likewise loads the original
+full-density mesh. Open `/showcase` for the separate full-screen storyboard: it
+starts each generation with its saved source image centered, moves that image to
+the upper-right, replays the recorded stages, and then lingers on a slowly
+rotating final model. New generations retain the original upload byte-for-byte
+for display, plus the full-resolution processed PNG actually used by TRELLIS for
+repeatable server-side regeneration without another upload. Select a saved mesh
+and use **regenerate from saved image** to run it again with the current settings.
+Older manifests fall back to their thumbnail and can only regenerate when their
+older processed source file is available.
 
 On a 16 GB RTX 50-series: the 512 fine path runs image→mesh in ~110 s (~1M-vertex
 512³ mesh); the 1024 cascade adds a second 1.3B-model pass and the 1024³ decoder
@@ -44,14 +72,19 @@ for a ~5M-vertex mesh (~5 min, ~10 GB VRAM, and a ~14 GB host-RAM spike for the
 ## Pipeline
 
 ```
-image (RGBA)
+image (RGB/RGBA)
+  → background cleanup  border-connected black/white → feathered alpha        [C++/browser]
   → preprocess          alpha bbox crop, premultiply, PIL-exact Lanczos-512   [C++, byte-exact]
   → DINOv3 ViT-L/16     [1, 1029, 1024] conditioning tokens                   [C++/ggml]
   → SS-flow DiT         1.3B dense DiT, 12-step CFG flow-Euler → z_s          [C++/ggml]
   → SS decoder          dense 3D-conv → 64³ occupancy → 32³ voxel scaffold    [C++/ggml]
   → shape-SLAT DiT      1.3B sparse DiT over active voxels, 12-step CFG       [C++/ggml]
-  → shape VAE decoder   sparse ConvNeXt U-Net, 16× up → 512³ dual-grid fields [C++/ggml]
-  → flexible dual grid  → triangle mesh                                       [C++]
+  → shape VAE decoder   sparse ConvNeXt U-Net, 16× up → decoded dual grid      [C++/ggml]
+  ├→ flexible dual grid → triangle mesh                                        [C++]
+  └→ shape VAE encoder  validated dual-grid → shape SLat + subdivision guide   [C++/ggml]
+     → texture-SLAT DiT shape-SLat concat conditioning                         [C++/ggml]
+     → texture decoder  replay subdivision → sparse 6-channel PBR volume       [C++/ggml]
+  → material sampling   trilinear PBR at surface vertices                      [C++]
 ```
 
 The **1024 cascade** (default in TRELLIS.2) adds a second pass on top: the 512
@@ -61,7 +94,9 @@ conditioned on a 1024-res DINOv3 encode) and the same decoder at 1024³ — a
 ~5M-vertex mesh. The ~49k-token HR attention only fits in VRAM via flash
 attention (`sdpa_auto`); see [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
-Every stage is validated tap-by-tap against the PyTorch reference — see
+The neural components are validated tap-by-tap against the PyTorch reference,
+with separate integration regressions for subdivision guidance, sparse material
+sampling, and GLB alpha preservation — see
 [docs/VERIFICATION.md](docs/VERIFICATION.md). Highlights: preprocessing is
 byte-exact, the DINOv3 encoder matches to rel-L2 ≤ 7e-7 across 40 taps, and the
 sparse U-Net decoder is numerically exact through all four conv levels.
@@ -71,6 +106,11 @@ sparse U-Net decoder is numerically exact through all four conv levels.
 - **Image preprocessing + DINOv3 encoder** — `trellis2_preprocess_rgba()`
   reproduces `pipeline.preprocess_image` (the has-alpha path) with a
   PIL-compatible fixed-point Lanczos-3 resampler (byte-exact vs Pillow).
+  `trellis2_remove_solid_background_rgba()` first converts a detected near-black
+  or near-white background connected to the image border into softly feathered
+  alpha, while preserving enclosed black/white subject details and existing
+  alpha masks. The demo exposes automatic, forced-black, forced-white, and keep
+  original modes.
   `trellis2_dino_encode()` runs the full DINOv3 ViT-L/16 (axial-2D RoPE,
   LayerScale, exact-GELU MLP) and applies the affine-free final LayerNorm the
   flow models expect — the `[1, 1029, 1024]` conditioning that used to come
@@ -145,6 +185,15 @@ sparse U-Net decoder is numerically exact through all four conv levels.
   per-voxel output (dual-vertex offset, per-axis intersection flags, quad split
   weight) into the triangle mesh. This is the real TRELLIS.2 geometry, driven
   end-to-end by the demo server.
+
+- **PBR texture generation** — the decoded dual grid is encoded to the shape
+  SLat used to condition texture flow, using the numerically validated
+  standalone texturing path. The decoded six-channel volume (base color,
+  metallic, roughness, alpha) is sampled trilinearly at the actual dual-grid
+  surface positions. Collapsed all-saturated outputs are rejected instead of
+  being persisted as apparently successful textures. The browser linearizes base
+  color before PBR lighting and preserves opacity. Material sampling steps are
+  controlled separately from geometry steps, matching upstream's defaults.
 
 ## Validate the forward pass
 
@@ -231,10 +280,10 @@ reduction.
 | `trellis2.cpp` | implementation                                         |
 | `convert_ss_flow_to_gguf.py` | stage-1 DiT checkpoint → GGUF converter  |
 | `convert_ss_dec_to_gguf.py`  | stage-1 decoder checkpoint → GGUF converter |
-| `mesh_export.{h,cpp}` | CUDA-free textured-GLB bake: decimate → UV atlas → PBR bake → glTF |
+| `mesh_export.{h,cpp}` | CUDA-free full-density GLB export with direct vertex colour/PBR attributes |
 | `examples/`    | CLI tools (`dino_info`, `ss_flow_info`, `ss_sample`, `ss_decode`, `ss_mesh`, `mesh2glb`) |
 | `examples/marching_cubes.h` | single-file isosurface → OBJ extractor      |
-| `third_party/` | vendored `meshoptimizer` (QEM decimate) + `xatlas` (opt-in charts) |
+| `third_party/` | vendored `xatlas` (opt-in chart-based UV unwrap) |
 | `ggml/`        | submodule, pinned to the same commit as sam3.cpp       |
 | `stb/`         | `stb_image.h` / `stb_image_write.h` for image I/O      |
 

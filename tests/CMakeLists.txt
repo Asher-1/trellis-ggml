@@ -20,6 +20,11 @@ target_link_libraries(test_preprocess PRIVATE trellis2)
 target_include_directories(test_preprocess PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../stb)
 target_compile_features(test_preprocess PRIVATE cxx_std_14)
 
+# Deterministic border-connected black/white background removal (no models).
+add_executable(test_background_removal test_background_removal.cpp)
+target_link_libraries(test_background_removal PRIVATE trellis2)
+target_compile_features(test_background_removal PRIVATE cxx_std_14)
+
 # DINOv3 encoder per-layer parity vs the PyTorch reference
 # (scripts/dump_dino_reference.py -> dumps/reference_dino.gguf).
 add_executable(test_dino test_dino.cpp)
@@ -50,6 +55,16 @@ add_executable(test_marching_cubes test_marching_cubes.cpp)
 target_include_directories(test_marching_cubes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../examples)
 target_compile_features(test_marching_cubes PRIVATE cxx_std_14)
 
+# Sparse PBR-volume trilinear sampling used by the integrated texture path.
+add_executable(test_pbr_sampling test_pbr_sampling.cpp)
+target_include_directories(test_pbr_sampling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_compile_features(test_pbr_sampling PRIVATE cxx_std_14)
+
+# CPU GLB bake smoke/regression test, including six-channel alpha preservation.
+add_executable(test_mesh_export test_mesh_export.cpp)
+target_link_libraries(test_mesh_export PRIVATE trellis2)
+target_compile_features(test_mesh_export PRIVATE cxx_std_14)
+
 # ── ctest registration ────────────────────────────────────────────────────────
 # Asset paths default to the in-repo locations produced by
 # scripts/download_models.sh + converters + scripts/refgen.sh, overridable via
@@ -66,6 +81,9 @@ endif()
 set(T2_TESTS "${CMAKE_CURRENT_SOURCE_DIR}")
 
 add_test(NAME marching_cubes COMMAND test_marching_cubes)
+add_test(NAME pbr_sampling COMMAND test_pbr_sampling)
+add_test(NAME mesh_export COMMAND test_mesh_export)
+add_test(NAME background_removal COMMAND test_background_removal)
 
 add_test(NAME preprocess COMMAND test_preprocess
          "${T2_DUMPS}/fixture_rgba.png" "${T2_DUMPS}/fixture_512.png")
