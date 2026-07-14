@@ -904,23 +904,25 @@ $("pexport").addEventListener("click", async () => {
   }
 });
 
-// Download a full-density vertex-coloured GLB using the visible export settings.
+// Bake with a bodyless preflight, then let the browser stream the large GLB to
+// its native download manager. Fetching 100+ MiB into an ArrayBuffer/Blob can
+// exhaust a remote device's browser memory and reports only "Failed to fetch".
 $("dglb").addEventListener("click", async () => {
   if (!glbJobId) return;
   const btn = $("dglb");
   btn.disabled = true; btn.textContent = "baking GLB…";
   try {
     const query = exportQuery();
-    const r = await fetch(`/api/glb/${glbJobId}?${query}`);
-    if (!r.ok) throw new Error(await r.text());
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
+    const url = `/api/glb/${glbJobId}?${query}`;
+    const r = await fetch(url, { method: "HEAD" });
+    if (!r.ok) throw new Error(r.headers.get("x-trellis-error") || `server returned HTTP ${r.status}`);
+    const bytes = Number(r.headers.get("content-length")) || 0;
     const a = document.createElement("a");
     a.href = url;
     a.download = `trellis2-${glbJobId}.glb`;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    $("exportinfo").textContent = "vertex-colour GLB downloaded · ready for Three.js GLTFLoader";
+    const size = bytes ? ` (${(bytes / (1 << 20)).toFixed(1)} MiB)` : "";
+    $("exportinfo").textContent = `GLB download started${size} · ready for Three.js GLTFLoader`;
     btn.textContent = "download GLB";
   } catch (e) {
     setStatus("GLB bake failed: " + e.message, true);

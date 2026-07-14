@@ -22,6 +22,7 @@
 package main
 
 import (
+	"bytes"
 	"embed"
 	"encoding/binary"
 	"encoding/json"
@@ -106,14 +107,15 @@ type job struct {
 	keyframes    int      // intermediate shape-SLAT mesh keyframes to record (0 = off)
 	previews     [][]byte // every preview blob, in order; served by /api/preview?seq=
 	mesh         *meshData
-	exportMesh   *meshData // cached component-cleanup preview for exportKey
-	exportKey    string    // component mode
-	glb          []byte    // cached last GLB bake
-	glbKey       string    // "tex-components" the cached GLB was baked with
-	persistDir   string    // committed on-disk job directory; empty before save
-	meshPath     string    // final T2MESH file, loaded lazily after a restart
-	inputPath    string    // processed generation input, persisted for regeneration
-	sourcePath   string    // exact original upload, persisted for showcase/display
+	exportMesh   *meshData  // cached component-cleanup preview for exportKey
+	exportKey    string     // component mode
+	glb          []byte     // cached last GLB bake
+	glbKey       string     // "tex-components" the cached GLB was baked with
+	exportMu     sync.Mutex // serializes large export preparation/bakes per job
+	persistDir   string     // committed on-disk job directory; empty before save
+	meshPath     string     // final T2MESH file, loaded lazily after a restart
+	inputPath    string     // processed generation input, persisted for regeneration
+	sourcePath   string     // exact original upload, persisted for showcase/display
 }
 
 type server struct {
@@ -824,37 +826,64 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 // handleGLB writes the exact prepared preview mesh into a vertex-coloured GLB.
 // Both prepared geometry and final GLB are cached by their export settings.
 func (s *server) handleGLB(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "GET or HEAD only", http.StatusMethodNotAllowed)
+		return
+	}
 	j := s.getJob(r, "/api/glb/")
 	if j == nil {
 		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
 	o := parseExportOptions(r)
-	mesh, err := s.preparedExportMesh(j, o)
-	if err != nil {
-		http.Error(w, "prepare export: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
 	key := o.glbKey()
 
-	j.mu.Lock()
-	glb, cached := j.glb, j.glbKey == key && j.glb != nil
-	j.mu.Unlock()
-
-	if !cached {
+	j.exportMu.Lock()
+	glb, err := func() ([]byte, error) {
+		mesh, err := s.preparedExportMesh(j, o)
+		if err != nil {
+			return nil, fmt.Errorf("prepare export: %w", err)
+		}
+		j.mu.Lock()
+		glb, cached := j.glb, j.glbKey == key && j.glb != nil
+		j.mu.Unlock()
+		if cached {
+			return glb, nil
+		}
+		started := time.Now()
 		glb, err = s.eng.BakeGLB(mesh, o.textureSize, 2 /*already prepared*/)
 		if err != nil {
-			http.Error(w, "bake glb: "+err.Error(), http.StatusInternalServerError)
-			return
+			return nil, fmt.Errorf("bake glb: %w", err)
 		}
 		j.mu.Lock()
 		j.glb, j.glbKey = glb, key
 		j.mu.Unlock()
+		log.Printf("job %s baked %.1f MiB GLB in %.1fs (%s)", j.ID,
+			float64(len(glb))/(1<<20), time.Since(started).Seconds(), key)
+		return glb, nil
+	}()
+	j.exportMu.Unlock()
+	if err != nil {
+		w.Header().Set("X-Trellis-Error", err.Error())
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
+	j.mu.Lock()
+	finishedAt := j.FinishedAt
+	j.mu.Unlock()
+	var modTime time.Time
+	if finishedAt > 0 {
+		modTime = time.UnixMilli(finishedAt)
+	}
 	w.Header().Set("Content-Type", "model/gltf-binary")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"trellis2-%s.glb\"", j.ID))
-	w.Write(glb)
+	w.Header().Set("ETag", fmt.Sprintf("\"%s-%s\"", j.ID, key))
+	// ServeContent supplies Content-Length plus byte-range support. Browsers can
+	// stream these 100+ MiB assets directly to disk and resume an interrupted
+	// transfer instead of JavaScript copying the whole response into a Blob.
+	http.ServeContent(w, r, fmt.Sprintf("trellis2-%s.glb", j.ID),
+		modTime, bytes.NewReader(glb))
 }
 
 func (s *server) info() map[string]interface{} {
