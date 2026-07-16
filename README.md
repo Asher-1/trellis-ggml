@@ -17,11 +17,8 @@ a Go demo server with a browser mesh viewer.
 
 ```sh
 git submodule update --init --depth 1                 # ggml
-scripts/download_models.sh                            # HF checkpoints -> models/ (~7 GB)
-docker build -f docker/Dockerfile.ref  -t trellis2-ref  docker   # convert weights / gen refs
+scripts/download_ggufs.sh                             # prebuilt f16 GGUFs -> ggufs/ (~14 GB)
 docker build -f docker/Dockerfile.demo -t trellis2-demo docker   # CUDA runtime + Go
-# convert every checkpoint to GGUF (f16 for the demo, f32 for validation)
-docker run --rm -v "$PWD":/work -w /work trellis2-ref bash scripts/convert_all.sh
 # build the CUDA shared lib + Go server, then run
 docker run --rm -v "$PWD":/work -w /work trellis2-demo bash -c '
   cmake -B build-cuda-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
@@ -32,6 +29,26 @@ docker run --rm --device nvidia.com/gpu=all -v "$PWD":/work -w /work/server -p 8
   -ggufs /work/ggufs -store /work/generations -unload-idle
 # open http://localhost:8742 and drop an image
 ```
+
+Or just run `scripts/demo.sh`, which builds the lib + server, auto-downloads any
+missing GGUFs, and launches the container.
+
+### Prebuilt GGUFs
+
+`scripts/download_ggufs.sh` pulls the ready-made f16 GGUFs from three public repos
+under the [LocalAI-io](https://huggingface.co/LocalAI-io) org, so you can skip the
+safetensors download and the conversion step entirely:
+
+- [`TRELLIS.2-4B-GGUF`](https://huggingface.co/LocalAI-io/TRELLIS.2-4B-GGUF) — MIT
+- [`TRELLIS-image-large-GGUF`](https://huggingface.co/LocalAI-io/TRELLIS-image-large-GGUF) — MIT
+- [`dinov3-vitl16-pretrain-lvd1689m-GGUF`](https://huggingface.co/LocalAI-io/dinov3-vitl16-pretrain-lvd1689m-GGUF) — DINOv3 License (Built with DINOv3)
+
+**Developers** who need the f32 validation variants, or who want to regenerate the
+GGUFs from source, use the original flow instead: `scripts/download_models.sh` (HF
+safetensors → `models/`, ~7 GB) then `docker run … trellis2-ref bash
+scripts/convert_all.sh` (safetensors → GGUF, f16 + f32). The card + license sources
+for the published repos live in `scripts/hf/`, and `scripts/upload_ggufs.sh`
+(re)publishes them.
 
 Completed generations are committed atomically under `generations/` (final
 mesh, replay frames, and manifest) and restored with the same job IDs after a
