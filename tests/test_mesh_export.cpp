@@ -109,6 +109,18 @@ int main() {
         std::fprintf(stderr, "full-density export changed the polygon count\n");
         return 1;
     }
+
+    // The API remains present in portable builds without CGAL and must fail
+    // explicitly instead of creating an untextured or incorrectly mapped GLB.
+    if (!t2glb::print_remesh_available()) {
+        if (t2glb::mesh_to_projected_glb(verts, 4, tris, 4,
+                                         verts, 4, tris, 4, pbr,
+                                         opt, glb, err) ||
+            err.find("unavailable") == std::string::npos) {
+            std::fprintf(stderr, "CGAL-free projected bake did not report unavailable\n");
+            return 1;
+        }
+    }
     std::puts("RESULT: PASS");
     return 0;
 }

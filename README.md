@@ -86,6 +86,27 @@ and use **regenerate from saved image** to run it again with the current setting
 Older manifests fall back to their thumbnail and can only regenerate when their
 older processed source file is available.
 
+When built with CGAL 5.5 or newer, asset export also offers **watertight print
+wrap**. It runs CPU Alpha Wrap over the selected components and previews the
+exact replacement geometry before download. CGAL guarantees the result is
+closed, oriented, intersection-free, and 2-manifold. `detail size` controls the
+smallest holes/cavities the wrap enters; `offset` controls how tightly it encloses
+the generated surface. Both are percentages of the source bounding-box diagonal.
+Because wrapping creates new vertices, its fast browser preview is geometry-only.
+When the source is textured, GLB download automatically unwraps the print mesh
+with xatlas and rebakes base color, metallic, roughness, and opacity: each atlas
+texel is projected through a CGAL AABB tree to the closest source triangle and
+receives its barycentrically interpolated dense PBR. This mirrors upstream's
+GPU remesh texture-transfer strategy on the CPU. Sources without PBR remain grey.
+This fixes solid topology; physical scale, minimum wall thickness, and supports
+still need to be chosen for the target printer/material.
+The same path is available without the server:
+
+```sh
+./build/examples/mesh2glb mesh.t2mesh printable.glb --print 1 0.0333
+# percentages: alpha/detail size, then enclosing offset
+```
+
 On a 16 GB RTX 50-series: the 512 fine path runs image→mesh in ~110 s (~1M-vertex
 512³ mesh); the 1024 cascade adds a second 1.3B-model pass and the 1024³ decoder
 for a ~5M-vertex mesh (~5 min, ~10 GB VRAM, and a ~14 GB host-RAM spike for the
@@ -276,6 +297,11 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+CGAL is auto-detected. Install CGAL 5.5 or newer before configuring to enable
+the portable CPU print-remesh backend, or pass `-DTRELLIS2_CGAL=OFF` to disable
+the probe explicitly. CMake prints whether Alpha Wrap was enabled. The standard
+demo container already includes CGAL 6.1.1.
+
 If you already cloned without `--recursive`:
 
 ```sh
@@ -302,10 +328,11 @@ reduction.
 | `trellis2.cpp` | implementation                                         |
 | `convert_ss_flow_to_gguf.py` | stage-1 DiT checkpoint → GGUF converter  |
 | `convert_ss_dec_to_gguf.py`  | stage-1 decoder checkpoint → GGUF converter |
-| `mesh_export.{h,cpp}` | CUDA-free full-density GLB export with direct vertex colour/PBR attributes |
+| `mesh_export.{h,cpp}` | CUDA-free GLB export with direct vertex PBR or projected UV-atlas textures |
+| `print_remesh.{h,cpp}` | optional CGAL Alpha Wrap reconstruction and closest-surface PBR transfer |
 | `examples/`    | CLI tools (`dino_info`, `ss_flow_info`, `ss_sample`, `ss_decode`, `ss_mesh`, `mesh2glb`) |
 | `examples/marching_cubes.h` | single-file isosurface → OBJ extractor      |
-| `third_party/` | vendored `xatlas` (opt-in chart-based UV unwrap) |
+| `third_party/` | vendored `xatlas` (print-wrap and opt-in ordinary UV unwrap) |
 | `ggml/`        | submodule, pinned to the same commit as sam3.cpp       |
 | `stb/`         | `stb_image.h` / `stb_image_write.h` for image I/O      |
 
@@ -315,3 +342,8 @@ MIT. See [LICENSE](LICENSE). Vendored third-party code is also MIT:
 [meshoptimizer](https://github.com/zeux/meshoptimizer) (Arseny Kapoulkine) and
 [xatlas](https://github.com/jpcy/xatlas) (Jonathan Young) under `third_party/`,
 and `stb` (public domain / MIT).
+
+The optional Alpha Wrap backend links against
+[CGAL](https://www.cgal.org/) 5.5 or newer. CGAL's 3D Alpha Wrapping package is
+GPL-3.0-or-later (or available under a commercial CGAL license), so binaries
+built with `TRELLIS2_CGAL=ON` and CGAL detected are subject to those terms.

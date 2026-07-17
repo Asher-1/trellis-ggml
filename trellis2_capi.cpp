@@ -956,6 +956,40 @@ t2_mesh_result * t2_prepare_mesh(const float * verts, int n_verts,
     return r;
 }
 
+int t2_print_remesh_available(void) {
+    return t2glb::print_remesh_available() ? 1 : 0;
+}
+
+t2_mesh_result * t2_prepare_print_mesh(const float * verts, int n_verts,
+                                       const int * tris, int n_tris,
+                                       const float * pbr,
+                                       int component_filter,
+                                       float alpha_ratio,
+                                       float offset_ratio,
+                                       char * err, int err_len) {
+    if (!verts || !tris || n_verts <= 0 || n_tris <= 0) {
+        copy_err(err, err_len, "empty mesh"); return nullptr;
+    }
+    if (component_filter < 0 || component_filter > 2) {
+        copy_err(err, err_len, "bad component filter"); return nullptr;
+    }
+    t2glb::MeshExportOptions opt;
+    opt.components = (t2glb::ComponentFilter) component_filter;
+    t2glb::PreparedMesh prepared;
+    std::string e;
+    if (!t2glb::prepare_print_mesh(verts, n_verts, (const int32_t *) tris, n_tris,
+                                   pbr, opt, alpha_ratio, offset_ratio,
+                                   prepared, e)) {
+        copy_err(err, err_len, e); return nullptr;
+    }
+    auto * r = new t2_mesh_result();
+    r->verts = std::move(prepared.verts);
+    r->normals = std::move(prepared.normals);
+    r->tris.assign(prepared.tris.begin(), prepared.tris.end());
+    r->pbr = std::move(prepared.pbr);
+    return r;
+}
+
 uint8_t * t2_bake_glb(const float * verts, int n_verts, const int * tris, int n_tris,
                       const float * pbr, int texture_size, int component_filter,
                       int * out_len, char * err, int err_len) {
@@ -972,6 +1006,39 @@ uint8_t * t2_bake_glb(const float * verts, int n_verts, const int * tris, int n_
     std::vector<uint8_t> glb;
     std::string e;
     if (!t2glb::mesh_to_glb(verts, n_verts, tris, n_tris, pbr, opt, glb, e)) {
+        copy_err(err, err_len, e); return nullptr;
+    }
+    uint8_t * buf = (uint8_t *) std::malloc(glb.size());
+    if (!buf) { copy_err(err, err_len, "out of memory"); return nullptr; }
+    std::memcpy(buf, glb.data(), glb.size());
+    if (out_len) *out_len = (int) glb.size();
+    return buf;
+}
+
+uint8_t * t2_bake_projected_glb(const float * target_verts, int target_n_verts,
+                                const int * target_tris, int target_n_tris,
+                                const float * source_verts, int source_n_verts,
+                                const int * source_tris, int source_n_tris,
+                                const float * source_pbr,
+                                int texture_size, int source_component_filter,
+                                int * out_len, char * err, int err_len) {
+    if (out_len) *out_len = 0;
+    if (!target_verts || !target_tris || target_n_verts <= 0 || target_n_tris <= 0 ||
+        !source_verts || !source_tris || !source_pbr || source_n_verts <= 0 || source_n_tris <= 0) {
+        copy_err(err, err_len, "empty projected GLB mesh"); return nullptr;
+    }
+    if (source_component_filter < 0 || source_component_filter > 2) {
+        copy_err(err, err_len, "bad component filter"); return nullptr;
+    }
+    t2glb::MeshExportOptions opt;
+    if (texture_size > 0) opt.texture_size = texture_size;
+    opt.components = (t2glb::ComponentFilter) source_component_filter;
+    std::vector<uint8_t> glb;
+    std::string e;
+    if (!t2glb::mesh_to_projected_glb(
+            target_verts, target_n_verts, (const int32_t *) target_tris, target_n_tris,
+            source_verts, source_n_verts, (const int32_t *) source_tris, source_n_tris,
+            source_pbr, opt, glb, e)) {
         copy_err(err, err_len, e); return nullptr;
     }
     uint8_t * buf = (uint8_t *) std::malloc(glb.size());

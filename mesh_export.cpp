@@ -1,5 +1,7 @@
 #include "mesh_export.h"
 
+#include "print_remesh.h"
+
 #include "xatlas.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -440,12 +442,198 @@ bool xatlas_unwrap(const std::vector<float> & dverts, const std::vector<float> &
     return true;
 }
 
+// UV unwrap and raster bake.  In the ordinary xatlas mode, PBR is interpolated
+// from the atlas mesh's own vertices.  For print wrapping, projection_source is
+// the dense pre-wrap mesh: every covered atlas texel is mapped to a 3D point on
+// the wrapped target, projected to the closest source triangle, and sampled
+// barycentrically.  That mirrors upstream's remesh -> UV raster -> BVH ->
+// attribute-field path without requiring CUDA.
+bool bake_atlas_locked(const PreparedMesh & mesh,
+                       const PreparedMesh * projection_source,
+                       const MeshExportOptions & opt,
+                       std::vector<uint8_t> & out,
+                       std::string & err) {
+    const int TS = opt.texture_size;
+    const int dnv = (int) (mesh.verts.size() / 3);
+    const int dnt = (int) (mesh.tris.size() / 3);
+    const bool vertex_pbr = mesh.pbr.size() == (size_t) dnv * 6;
+    const bool projected_pbr = projection_source != nullptr;
+    if (projected_pbr &&
+        projection_source->pbr.size() != projection_source->verts.size() / 3 * 6) {
+        err = "PBR projection source has no six-channel material";
+        return false;
+    }
+
+    std::vector<float> opos, onrm, ouv, opbr;
+    std::vector<uint32_t> oidx;
+    int AW = TS, AH = TS;
+    if (!xatlas_unwrap(mesh.verts, mesh.normals, mesh.pbr, dnv,
+                       mesh.tris, dnt, opt, TS,
+                       opos, onrm, ouv, opbr, oidx, AW, AH, err))
+        return false;
+    const uint32_t onv = (uint32_t) (opos.size() / 3);
+    const uint32_t ntri = (uint32_t) (oidx.size() / 3);
+
+    GLBLOG("rasterizing %u tris%s ...", ntri,
+           projected_pbr ? " for source-surface PBR projection" : "");
+    const int NP = AW * AH;
+    std::vector<float> bc((size_t) NP * 3, 0.0f), met(NP, 0.0f), rou(NP, 0.0f), alp(NP, 0.0f);
+    std::vector<uint8_t> mask(NP, 0);
+    std::vector<float> query_points;
+    std::vector<int32_t> query_pixels;
+    if (projected_pbr) {
+        query_points.reserve((size_t) NP * 2); // atlases are normally 60-80% occupied
+        query_pixels.reserve((size_t) NP * 2 / 3);
+    }
+    auto set_default = [&](int pix) {
+        bc[3*pix+0]=bc[3*pix+1]=bc[3*pix+2]=0.7f;
+        met[pix]=0.0f; rou[pix]=0.6f; alp[pix]=1.0f;
+    };
+
+    for (uint32_t t = 0; t < ntri; ++t) {
+        const uint32_t ia = oidx[3*t+0], ib = oidx[3*t+1], ic = oidx[3*t+2];
+        const float ax=ouv[2*ia+0], ay=ouv[2*ia+1];
+        const float bx=ouv[2*ib+0], by=ouv[2*ib+1];
+        const float cx=ouv[2*ic+0], cy=ouv[2*ic+1];
+        const float area = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
+        if (std::fabs(area) < 1e-9f) continue;
+        const float inv_area = 1.0f / area;
+        const int x0 = std::max(0, (int)std::floor(std::min({ax,bx,cx}) - 1));
+        const int x1 = std::min(AW-1, (int)std::ceil (std::max({ax,bx,cx}) + 1));
+        const int y0 = std::max(0, (int)std::floor(std::min({ay,by,cy}) - 1));
+        const int y1 = std::min(AH-1, (int)std::ceil (std::max({ay,by,cy}) + 1));
+        for (int py = y0; py <= y1; ++py) {
+            const float sy = py + 0.5f;
+            for (int px = x0; px <= x1; ++px) {
+                const float sx = px + 0.5f;
+                const float w0 = ((bx-sx)*(cy-sy) - (by-sy)*(cx-sx)) * inv_area;
+                const float w1 = ((cx-sx)*(ay-sy) - (cy-sy)*(ax-sx)) * inv_area;
+                const float w2 = 1.0f - w0 - w1;
+                const float e = -0.001f;
+                if (w0 < e || w1 < e || w2 < e) continue;
+                const int pix = py*AW + px;
+                if (projected_pbr) {
+                    // Shared triangle edges can cover the same pixel twice.
+                    // The positions agree, so retain the first and issue one
+                    // expensive closest-surface query per atlas texel.
+                    if (mask[pix]) continue;
+                    for (int k = 0; k < 3; ++k)
+                        query_points.push_back(w0*opos[3*ia+k] +
+                                               w1*opos[3*ib+k] +
+                                               w2*opos[3*ic+k]);
+                    query_pixels.push_back(pix);
+                    mask[pix] = 1;
+                    continue;
+                }
+                if (!vertex_pbr) {
+                    set_default(pix); mask[pix]=1; continue;
+                }
+                const float * a = opbr.data() + (size_t) ia * 6;
+                const float * b = opbr.data() + (size_t) ib * 6;
+                const float * c = opbr.data() + (size_t) ic * 6;
+                float val[6];
+                for (int ch = 0; ch < 6; ++ch) val[ch] = w0*a[ch] + w1*b[ch] + w2*c[ch];
+                bc[3*pix+0]=val[0]; bc[3*pix+1]=val[1]; bc[3*pix+2]=val[2];
+                met[pix]=val[3]; rou[pix]=val[4]; alp[pix]=val[5];
+                mask[pix]=1;
+            }
+        }
+    }
+
+    if (projected_pbr) {
+        GLBLOG("projecting %zu covered texels to %zu source tris ...",
+               query_pixels.size(), projection_source->tris.size() / 3);
+        std::vector<float> query_pbr;
+        if (!t2print::project_pbr(projection_source->verts,
+                                  projection_source->tris,
+                                  projection_source->pbr,
+                                  query_points, query_pbr, err))
+            return false;
+        if (query_pbr.size() != query_pixels.size() * 6) {
+            err = "PBR projection returned an invalid sample count";
+            return false;
+        }
+        for (size_t i = 0; i < query_pixels.size(); ++i) {
+            const int pix = query_pixels[i];
+            const float * val = query_pbr.data() + i * 6;
+            bc[3*pix+0]=val[0]; bc[3*pix+1]=val[1]; bc[3*pix+2]=val[2];
+            met[pix]=val[3]; rou[pix]=val[4]; alp[pix]=val[5];
+        }
+        query_points.clear(); query_points.shrink_to_fit();
+        query_pbr.clear(); query_pbr.shrink_to_fit();
+    }
+
+    // Edge-pad the gutter so bilinear sampling cannot bleed empty texels
+    // across chart seams.
+    {
+        std::vector<uint8_t> m = mask;
+        for (int pass = 0; pass < opt.dilate; ++pass) {
+            std::vector<uint8_t> nm = m;
+            for (int py = 0; py < AH; ++py)
+            for (int px = 0; px < AW; ++px) {
+                const int pix = py*AW+px;
+                if (m[pix]) continue;
+                float acc[6]={0,0,0,0,0,0}; int cnt=0;
+                for (int dy=-1; dy<=1; ++dy)
+                for (int dx=-1; dx<=1; ++dx) {
+                    const int qx=px+dx, qy=py+dy;
+                    if (qx<0||qx>=AW||qy<0||qy>=AH) continue;
+                    const int q=qy*AW+qx;
+                    if (!m[q]) continue;
+                    acc[0]+=bc[3*q+0]; acc[1]+=bc[3*q+1]; acc[2]+=bc[3*q+2];
+                    acc[3]+=met[q]; acc[4]+=rou[q]; acc[5]+=alp[q]; ++cnt;
+                }
+                if (cnt) {
+                    bc[3*pix+0]=acc[0]/cnt; bc[3*pix+1]=acc[1]/cnt; bc[3*pix+2]=acc[2]/cnt;
+                    met[pix]=acc[3]/cnt; rou[pix]=acc[4]/cnt; alp[pix]=acc[5]/cnt; nm[pix]=1;
+                }
+            }
+            m.swap(nm);
+        }
+    }
+
+    // glTF packs metallic in B and roughness in G. Base color is stored as
+    // generated (sRGB-like), matching upstream's base_color*255 texture path.
+    auto to8 = [](float f){ int v=(int)std::lround(f*255.0f); return (uint8_t) std::min(255,std::max(0,v)); };
+    std::vector<uint8_t> bc8((size_t) NP*4), mr8((size_t) NP*3);
+    for (int i = 0; i < NP; ++i) {
+        bc8[4*i+0]=to8(bc[3*i+0]); bc8[4*i+1]=to8(bc[3*i+1]);
+        bc8[4*i+2]=to8(bc[3*i+2]); bc8[4*i+3]=to8(alp[i]);
+        mr8[3*i+0]=0; mr8[3*i+1]=to8(rou[i]); mr8[3*i+2]=to8(met[i]);
+    }
+    int covered = 0, translucent = 0;
+    for (int i = 0; i < NP; ++i) if (mask[i]) {
+        ++covered;
+        if (alp[i] < 0.95f) ++translucent;
+    }
+    const bool transparent = translucent > 0 &&
+                             (int64_t) translucent * 1000 >= (int64_t) covered;
+    GLBLOG("inpaint + PNG encode ...");
+    std::vector<uint8_t> bc_png, mr_png;
+    if (!encode_png(AW, AH, 4, bc8.data(), bc_png) ||
+        !encode_png(AW, AH, 3, mr8.data(), mr_png)) {
+        err = "PNG encode failed"; return false;
+    }
+
+    std::vector<float> gpos((size_t)onv*3), gnrm((size_t)onv*3), guv((size_t)onv*2);
+    for (uint32_t i = 0; i < onv; ++i) {
+        gpos[3*i+0]= opos[3*i+0]; gpos[3*i+1]= opos[3*i+2]; gpos[3*i+2]=-opos[3*i+1];
+        gnrm[3*i+0]= onrm[3*i+0]; gnrm[3*i+1]= onrm[3*i+2]; gnrm[3*i+2]=-onrm[3*i+1];
+        guv[2*i+0]= ouv[2*i+0]/(float)AW; guv[2*i+1]= ouv[2*i+1]/(float)AH;
+    }
+    write_glb(gpos, gnrm, guv, oidx, bc_png, mr_png, transparent, out);
+    GLBLOG("GLB %zu bytes (%u verts, %u tris; %s PBR atlas)",
+           out.size(), onv, ntri, projected_pbr ? "projected" : "vertex");
+    return true;
+}
+
 bool prepare_mesh_locked(const float * verts, int nv,
                          const int32_t * tris, int nt,
                          const float * pbr,
                          const MeshExportOptions & opt,
                          PreparedMesh & out,
-                         std::string & err) {
+                         std::string & err,
+                         bool allow_atlas_smoothing = true) {
     if (!verts || !tris || nv <= 0 || nt <= 0) { err = "empty mesh"; return false; }
     out = PreparedMesh{};
 
@@ -459,7 +647,8 @@ bool prepare_mesh_locked(const float * verts, int nv,
 
     // xatlas optionally regularises the geometry; do it here so the preview is
     // the geometry that will actually be written to the GLB.
-    if (std::getenv("T2GLB_XATLAS") && !std::getenv("T2GLB_NOSMOOTH"))
+    if (allow_atlas_smoothing && std::getenv("T2GLB_XATLAS") &&
+        !std::getenv("T2GLB_NOSMOOTH"))
         taubin_smooth(out.verts, out.tris, 3);
     vertex_normals(out.verts, out.tris, out.normals);
     return true;
@@ -479,6 +668,30 @@ bool prepare_mesh(const float * verts, int nv,
     return prepare_mesh_locked(verts, nv, tris, nt, pbr, opt, out, err);
 }
 
+bool print_remesh_available() { return t2print::available(); }
+
+bool prepare_print_mesh(const float * verts, int nv,
+                        const int32_t * tris, int nt,
+                        const float * pbr,
+                        const MeshExportOptions & opt,
+                        float alpha_ratio, float offset_ratio,
+                        PreparedMesh & out,
+                        std::string & err) {
+    (void) pbr; // new Alpha Wrap vertices cannot retain source vertex attributes
+    PreparedMesh source;
+    if (!prepare_mesh(verts, nv, tris, nt, nullptr, opt, source, err)) return false;
+
+    PreparedMesh wrapped;
+    if (!t2print::alpha_wrap(source.verts, source.tris, alpha_ratio, offset_ratio,
+                             wrapped.verts, wrapped.normals, wrapped.tris, err))
+        return false;
+    // Alpha Wrap constructs new offset vertices. Retaining source per-vertex
+    // attributes would silently attach colors/materials to unrelated points.
+    wrapped.pbr.clear();
+    out = std::move(wrapped);
+    return true;
+}
+
 bool mesh_to_glb(const float * verts, int nv,
                  const int32_t * tris, int nt,
                  const float * pbr,
@@ -494,11 +707,7 @@ bool mesh_to_glb(const float * verts, int nv,
     // 1) preserve topology + optional component filter --------------------
     PreparedMesh prepared;
     if (!prepare_mesh_locked(verts, nv, tris, nt, pbr, opt, prepared, err)) return false;
-    std::vector<float> & dverts = prepared.verts;
-    std::vector<float> & dnrm = prepared.normals;
-    std::vector<int32_t> & dtris = prepared.tris;
-    std::vector<float> & dpbr = prepared.pbr;
-    const int dnv = (int)(dverts.size()/3), dnt = (int)(dtris.size()/3);
+    const int dnv = (int)(prepared.verts.size()/3), dnt = (int)(prepared.tris.size()/3);
     const bool use_xatlas = std::getenv("T2GLB_XATLAS") != nullptr;
 
     // A fixed-size per-triangle grid atlas cannot represent a full-density
@@ -512,132 +721,44 @@ bool mesh_to_glb(const float * verts, int nv,
         return true;
     }
 
-    // 2) UV atlas ----------------------------------------------------------
-    // Output-vertex streams: opos/onrm (geometry) and ouv (atlas-texel space),
-    // plus the triangle index buffer oidx and atlas dims AW×AH.
-    std::vector<float> opos, onrm, ouv, opbr;
-    std::vector<uint32_t> oidx;
-    int AW = TS, AH = TS;
+    return bake_atlas_locked(prepared, nullptr, opt, out, err);
+}
 
-    // Chart-based unwrap (proper, editable UVs). Only fast on clean, manifold
-    // meshes — machine-generated dual-grid geometry shatters it into tens of
-    // thousands of charts. It remains an explicit experimental opt-in.
-    if (!xatlas_unwrap(dverts, dnrm, dpbr, dnv, dtris, dnt, opt, TS,
-                       opos, onrm, ouv, opbr, oidx, AW, AH, err))
+bool mesh_to_projected_glb(const float * target_verts, int target_nv,
+                           const int32_t * target_tris, int target_nt,
+                           const float * source_verts, int source_nv,
+                           const int32_t * source_tris, int source_nt,
+                           const float * source_pbr,
+                           const MeshExportOptions & opt,
+                           std::vector<uint8_t> & out,
+                           std::string & err) {
+    if (!t2print::available()) {
+        err = "PBR projection is unavailable (rebuild with CGAL >= 5.5)";
         return false;
-    const uint32_t onv = (uint32_t)(opos.size()/3);
-    const uint32_t ntri = (uint32_t)(oidx.size()/3);
-
-    // 3) bake --------------------------------------------------------------
-    GLBLOG("rasterizing %u tris ...", ntri);
-
-    const int NP = AW * AH;
-    std::vector<float> bc(NP*3, 0.0f), met(NP, 0.0f), rou(NP, 0.0f), alp(NP, 0.0f);
-    std::vector<uint8_t> mask(NP, 0);
-    // Defaults for the untextured path / unfilled charts.
-    auto set_default = [&](int pix) {
-        bc[3*pix+0]=bc[3*pix+1]=bc[3*pix+2]=0.7f;
-        met[pix]=0.0f; rou[pix]=0.6f; alp[pix]=1.0f;
-    };
-
-    for (uint32_t t = 0; t < ntri; ++t) {
-        uint32_t ia = oidx[3*t+0], ib = oidx[3*t+1], ic = oidx[3*t+2];
-        float ax=ouv[2*ia+0], ay=ouv[2*ia+1];
-        float bx=ouv[2*ib+0], by=ouv[2*ib+1];
-        float cx=ouv[2*ic+0], cy=ouv[2*ic+1];
-        float area = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
-        if (std::fabs(area) < 1e-9f) continue;
-        float inv_area = 1.0f / area;
-        int x0 = std::max(0, (int)std::floor(std::min({ax,bx,cx}) - 1));
-        int x1 = std::min(AW-1, (int)std::ceil (std::max({ax,bx,cx}) + 1));
-        int y0 = std::max(0, (int)std::floor(std::min({ay,by,cy}) - 1));
-        int y1 = std::min(AH-1, (int)std::ceil (std::max({ay,by,cy}) + 1));
-        for (int py = y0; py <= y1; ++py) {
-            float sy = py + 0.5f;
-            for (int px = x0; px <= x1; ++px) {
-                float sx = px + 0.5f;
-                float w0 = ((bx-sx)*(cy-sy) - (by-sy)*(cx-sx)) * inv_area;
-                float w1 = ((cx-sx)*(ay-sy) - (cy-sy)*(ax-sx)) * inv_area;
-                float w2 = 1.0f - w0 - w1;
-                const float e = -0.001f;
-                if (w0 < e || w1 < e || w2 < e) continue;
-                int pix = py*AW + px;
-                if (!pbr) { set_default(pix); mask[pix]=1; continue; }
-                const float * a = opbr.data() + (size_t) ia * 6;
-                const float * b = opbr.data() + (size_t) ib * 6;
-                const float * c = opbr.data() + (size_t) ic * 6;
-                float val[6];
-                for (int ch = 0; ch < 6; ++ch) val[ch] = w0*a[ch] + w1*b[ch] + w2*c[ch];
-                bc[3*pix+0]=val[0]; bc[3*pix+1]=val[1]; bc[3*pix+2]=val[2];
-                met[pix]=val[3]; rou[pix]=val[4]; alp[pix]=val[5];
-                mask[pix]=1;
-            }
-        }
+    }
+    if (!target_verts || !target_tris || target_nv <= 0 || target_nt <= 0 ||
+        !source_verts || !source_tris || !source_pbr || source_nv <= 0 || source_nt <= 0) {
+        err = "empty projected GLB mesh";
+        return false;
+    }
+    if (opt.texture_size < 16 || opt.texture_size > 8192) {
+        err = "bad texture_size";
+        return false;
     }
 
-    // 4) inpaint (edge-pad dilation) — fill the gutter so bilinear/mip sampling
-    // doesn't bleed empty texels across chart seams.
-    {
-        std::vector<uint8_t> m = mask;
-        for (int pass = 0; pass < opt.dilate; ++pass) {
-            std::vector<uint8_t> nm = m;
-            for (int py = 0; py < AH; ++py)
-            for (int px = 0; px < AW; ++px) {
-                int pix = py*AW+px;
-                if (m[pix]) continue;
-                float acc[6]={0,0,0,0,0,0}; int cnt=0;
-                for (int dy=-1; dy<=1; ++dy)
-                for (int dx=-1; dx<=1; ++dx) {
-                    int qx=px+dx, qy=py+dy;
-                    if (qx<0||qx>=AW||qy<0||qy>=AH) continue;
-                    int q=qy*AW+qx;
-                    if (!m[q]) continue;
-                    acc[0]+=bc[3*q+0]; acc[1]+=bc[3*q+1]; acc[2]+=bc[3*q+2];
-                    acc[3]+=met[q]; acc[4]+=rou[q]; acc[5]+=alp[q]; ++cnt;
-                }
-                if (cnt) {
-                    bc[3*pix+0]=acc[0]/cnt; bc[3*pix+1]=acc[1]/cnt; bc[3*pix+2]=acc[2]/cnt;
-                    met[pix]=acc[3]/cnt; rou[pix]=acc[4]/cnt; alp[pix]=acc[5]/cnt; nm[pix]=1;
-                }
-            }
-            m.swap(nm);
-        }
-    }
-
-    // 5) pack channel images. baseColor is an sRGB texture (values written as-is,
-    // matching the reference's base_color*255 → baseColorTexture). glTF packs
-    // metallic→B, roughness→G (R unused).
-    auto to8 = [](float f){ int v=(int)std::lround(f*255.0f); return (uint8_t) std::min(255,std::max(0,v)); };
-    std::vector<uint8_t> bc8(NP*4), mr8(NP*3);
-    for (int i = 0; i < NP; ++i) {
-        bc8[4*i+0]=to8(bc[3*i+0]); bc8[4*i+1]=to8(bc[3*i+1]);
-        bc8[4*i+2]=to8(bc[3*i+2]); bc8[4*i+3]=to8(alp[i]);
-        mr8[3*i+0]=0; mr8[3*i+1]=to8(rou[i]); mr8[3*i+2]=to8(met[i]);
-    }
-    int covered = 0, translucent = 0;
-    for (int i = 0; i < NP; ++i) if (mask[i]) {
-        ++covered;
-        if (alp[i] < 0.95f) ++translucent;
-    }
-    const bool transparent = translucent > 0 &&
-                             (int64_t) translucent * 1000 >= (int64_t) covered;
-    GLBLOG("inpaint + PNG encode ...");
-    std::vector<uint8_t> bc_png, mr_png;
-    if (!encode_png(AW, AH, 4, bc8.data(), bc_png) || !encode_png(AW, AH, 3, mr8.data(), mr_png)) {
-        err = "PNG encode failed"; return false;
-    }
-
-    // 6) final vertex streams with the Trellis→glTF (Y-up) axis convention:
-    // (x,y,z) → (x, z, -y); UVs normalised (top-left origin, no V flip).
-    std::vector<float> gpos(onv*3), gnrm(onv*3), guv(onv*2);
-    for (uint32_t i = 0; i < onv; ++i) {
-        gpos[3*i+0]= opos[3*i+0]; gpos[3*i+1]= opos[3*i+2]; gpos[3*i+2]=-opos[3*i+1];
-        gnrm[3*i+0]= onrm[3*i+0]; gnrm[3*i+1]= onrm[3*i+2]; gnrm[3*i+2]=-onrm[3*i+1];
-        guv[2*i+0]= ouv[2*i+0]/(float)AW; guv[2*i+1]= ouv[2*i+1]/(float)AH;
-    }
-    write_glb(gpos, gnrm, guv, oidx, bc_png, mr_png, transparent, out);
-    GLBLOG("GLB %zu bytes (%u verts, %u tris)", out.size(), onv, ntri);
-    return true;
+    std::lock_guard<std::mutex> lock(g_bake_mu);
+    PreparedMesh target, source;
+    MeshExportOptions target_opt = opt;
+    target_opt.components = ComponentFilter::KeepAll;
+    // The target is the exact already-previewed Alpha Wrap.  Do not let the
+    // legacy T2GLB_XATLAS smoothing switch move it during export.
+    if (!prepare_mesh_locked(target_verts, target_nv, target_tris, target_nt,
+                             nullptr, target_opt, target, err, false))
+        return false;
+    if (!prepare_mesh_locked(source_verts, source_nv, source_tris, source_nt,
+                             source_pbr, opt, source, err, false))
+        return false;
+    return bake_atlas_locked(target, &source, opt, out, err);
 }
 
 } // namespace t2glb

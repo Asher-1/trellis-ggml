@@ -50,6 +50,7 @@ add_library(trellis2
     trellis2.cpp trellis2.h
     trellis2_capi.cpp trellis2_capi.h
     mesh_export.cpp mesh_export.h
+    print_remesh.cpp print_remesh.h
     third_party/xatlas/xatlas.cpp)
 target_include_directories(trellis2 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -69,6 +70,23 @@ endif()
 
 target_link_libraries(trellis2 PUBLIC ${TRELLIS2_GGML_TARGET} PRIVATE Threads::Threads)
 target_compile_features(trellis2 PUBLIC cxx_std_14)
+
+# CGAL Alpha Wrap turns arbitrary TRELLIS triangle soups into watertight,
+# intersection-free 2-manifolds for printing. Auto-detect it so ordinary builds
+# retain no CGAL dependency; the C API reports whether the backend is present.
+option(TRELLIS2_CGAL "Enable CGAL Alpha Wrap print remeshing when available" ON)
+if(TRELLIS2_CGAL)
+    find_package(CGAL 5.5 QUIET)
+    if(CGAL_FOUND)
+        target_link_libraries(trellis2 PRIVATE CGAL::CGAL)
+        target_compile_definitions(trellis2 PRIVATE TRELLIS2_USE_CGAL=1)
+        target_compile_features(trellis2 PRIVATE cxx_std_17)
+        set(TRELLIS2_HAVE_CGAL ON)
+        message(STATUS "CGAL Alpha Wrap print remeshing: enabled")
+    else()
+        message(STATUS "CGAL Alpha Wrap print remeshing: unavailable (CGAL >= 5.5 not found)")
+    endif()
+endif()
 
 set_property(TARGET trellis2 PROPERTY POSITION_INDEPENDENT_CODE ON)
 

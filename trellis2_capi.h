@@ -26,7 +26,7 @@
 extern "C" {
 #endif
 
-#define T2_CAPI_ABI_VERSION 9
+#define T2_CAPI_ABI_VERSION 11
 
 TRELLIS2_CAPI int t2_abi_version(void);
 
@@ -164,6 +164,21 @@ TRELLIS2_CAPI t2_mesh_result * t2_prepare_mesh(const float * verts, int n_verts,
                                                int component_filter,
                                                char * err, int err_len);
 
+/* Optional CGAL Alpha Wrap print remeshing. Availability is fixed at build
+** time. alpha_ratio and offset_ratio are fractions of the component-filtered
+** input bounding-box diagonal (recommended starting point: 0.01 and
+** 0.01/30). The returned geometry is watertight, oriented, intersection-free,
+** 2-manifold, and geometry-only (no PBR) because wrapping creates new vertices.
+** Use t2_bake_projected_glb to transfer source PBR onto its UV atlas. */
+TRELLIS2_CAPI int t2_print_remesh_available(void);
+TRELLIS2_CAPI t2_mesh_result * t2_prepare_print_mesh(const float * verts, int n_verts,
+                                                     const int * tris, int n_tris,
+                                                     const float * pbr,
+                                                     int component_filter,
+                                                     float alpha_ratio,
+                                                     float offset_ratio,
+                                                     char * err, int err_len);
+
 /* Bake a mesh into a portable UV-atlas-textured GLB (glTF 2.0 binary): optional
 ** component cleanup -> UV unwrap -> per-texel PBR bake (from the dense
 ** per-vertex attributes) -> gutter inpaint -> glTF. All CPU, no CUDA.
@@ -178,6 +193,21 @@ TRELLIS2_CAPI uint8_t * t2_bake_glb(const float * verts, int n_verts,
                                     const int * tris, int n_tris,
                                     const float * pbr,
                                     int texture_size, int component_filter,
+                                    int * out_len, char * err, int err_len);
+
+/* Bake a UV-atlas PBR GLB for replacement geometry by closest-surface
+** projection from a dense source mesh. Every covered target atlas texel is
+** projected to a source triangle and receives barycentrically interpolated
+** source PBR. This is the CPU/CGAL counterpart of upstream's cuBVH rebake.
+** source_component_filter has the same 0/1/2 values as component_filter above.
+** Returns NULL when CGAL support is unavailable. */
+TRELLIS2_CAPI uint8_t * t2_bake_projected_glb(
+                                    const float * target_verts, int target_n_verts,
+                                    const int * target_tris, int target_n_tris,
+                                    const float * source_verts, int source_n_verts,
+                                    const int * source_tris, int source_n_tris,
+                                    const float * source_pbr,
+                                    int texture_size, int source_component_filter,
                                     int * out_len, char * err, int err_len);
 TRELLIS2_CAPI void      t2_free_buffer(uint8_t * buf);
 

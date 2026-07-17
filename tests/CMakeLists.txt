@@ -65,6 +65,12 @@ add_executable(test_mesh_export test_mesh_export.cpp)
 target_link_libraries(test_mesh_export PRIVATE trellis2)
 target_compile_features(test_mesh_export PRIVATE cxx_std_14)
 
+if(TRELLIS2_HAVE_CGAL)
+    add_executable(test_print_remesh test_print_remesh.cpp)
+    target_link_libraries(test_print_remesh PRIVATE trellis2)
+    target_compile_features(test_print_remesh PRIVATE cxx_std_14)
+endif()
+
 # ── ctest registration ────────────────────────────────────────────────────────
 # Asset paths default to the in-repo locations produced by
 # scripts/download_models.sh + converters + scripts/refgen.sh, overridable via
@@ -83,6 +89,9 @@ set(T2_TESTS "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME marching_cubes COMMAND test_marching_cubes)
 add_test(NAME pbr_sampling COMMAND test_pbr_sampling)
 add_test(NAME mesh_export COMMAND test_mesh_export)
+if(TRELLIS2_HAVE_CGAL)
+    add_test(NAME print_remesh COMMAND test_print_remesh)
+endif()
 add_test(NAME background_removal COMMAND test_background_removal)
 
 add_test(NAME preprocess COMMAND test_preprocess

@@ -13,7 +13,7 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-const abiVersion = 9
+const abiVersion = 11
 
 // Progress stages (enum t2_stage).
 const (
@@ -92,8 +92,16 @@ type engine struct {
 	meshFree     func(r uintptr)
 	prepareMeshC func(verts unsafe.Pointer, nv int32, tris unsafe.Pointer, nt int32, pbr unsafe.Pointer,
 		componentFilter int32, err unsafe.Pointer, errLen int32) uintptr
+	printRemeshAvailable func() int32
+	preparePrintMeshC    func(verts unsafe.Pointer, nv int32, tris unsafe.Pointer, nt int32, pbr unsafe.Pointer,
+		componentFilter int32, alphaRatio, offsetRatio float32,
+		err unsafe.Pointer, errLen int32) uintptr
 	bakeGLB func(verts unsafe.Pointer, nv int32, tris unsafe.Pointer, nt int32, pbr unsafe.Pointer,
 		texSize, componentFilter int32, outLen unsafe.Pointer, err unsafe.Pointer, errLen int32) uintptr
+	bakeProjectedGLB func(targetVerts unsafe.Pointer, targetNV int32, targetTris unsafe.Pointer, targetNT int32,
+		sourceVerts unsafe.Pointer, sourceNV int32, sourceTris unsafe.Pointer, sourceNT int32,
+		sourcePBR unsafe.Pointer, texSize, sourceComponentFilter int32,
+		outLen unsafe.Pointer, err unsafe.Pointer, errLen int32) uintptr
 	freeBuffer func(buf uintptr)
 }
 
@@ -152,7 +160,10 @@ func newEngine(libPath, dinoGGUF, flowGGUF, decGGUF, slatGGUF, slatHRGGUF, shape
 	purego.RegisterLibFunc(&e.meshPBR, lib, "t2_mesh_pbr")
 	purego.RegisterLibFunc(&e.meshFree, lib, "t2_mesh_free")
 	purego.RegisterLibFunc(&e.prepareMeshC, lib, "t2_prepare_mesh")
+	purego.RegisterLibFunc(&e.printRemeshAvailable, lib, "t2_print_remesh_available")
+	purego.RegisterLibFunc(&e.preparePrintMeshC, lib, "t2_prepare_print_mesh")
 	purego.RegisterLibFunc(&e.bakeGLB, lib, "t2_bake_glb")
+	purego.RegisterLibFunc(&e.bakeProjectedGLB, lib, "t2_bake_projected_glb")
 	purego.RegisterLibFunc(&e.freeBuffer, lib, "t2_free_buffer")
 
 	if progressCallback == 0 {
@@ -365,6 +376,46 @@ func (e *engine) PrepareMesh(m *meshData, componentFilter int) (*meshData, error
 	return out, nil
 }
 
+// HasPrintRemesh reports whether this library was built with CGAL Alpha Wrap.
+func (e *engine) HasPrintRemesh() bool {
+	return e != nil && e.printRemeshAvailable != nil && e.printRemeshAvailable() != 0
+}
+
+// PreparePrintMesh component-filters and wraps arbitrary source topology in a
+// watertight, oriented, intersection-free 2-manifold. Ratios are fractions of
+// the source bounding-box diagonal. Alpha Wrap creates new geometry, so the
+// returned preview has no PBR stream; GLB download rebakes it per texel.
+func (e *engine) PreparePrintMesh(m *meshData, componentFilter int, alphaRatio, offsetRatio float32) (*meshData, error) {
+	if m == nil || m.NVerts == 0 || m.NTris == 0 {
+		return nil, fmt.Errorf("empty mesh")
+	}
+	if !e.HasPrintRemesh() || e.preparePrintMeshC == nil {
+		return nil, fmt.Errorf("print remeshing is unavailable (library was built without CGAL)")
+	}
+	var pbr unsafe.Pointer
+	if len(m.PBR) == 6*m.NVerts {
+		pbr = unsafe.Pointer(&m.PBR[0])
+	}
+	errBuf := make([]byte, 512)
+	r := e.preparePrintMeshC(unsafe.Pointer(&m.Verts[0]), int32(m.NVerts),
+		unsafe.Pointer(&m.Tris[0]), int32(m.NTris), pbr,
+		int32(componentFilter), alphaRatio, offsetRatio,
+		unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
+	if r == 0 {
+		return nil, fmt.Errorf("%s", cstr(errBuf))
+	}
+	defer e.meshFree(r)
+	nv, nt := int(e.meshNVerts(r)), int(e.meshNTris(r))
+	if nv == 0 || nt == 0 {
+		return nil, fmt.Errorf("empty print mesh")
+	}
+	out := &meshData{NVerts: nv, NTris: nt}
+	out.Verts = copyFloats(e.meshVerts(r), 3*nv)
+	out.Normals = copyFloats(e.meshNormals(r), 3*nv)
+	out.Tris = copyInts(e.meshTris(r), 3*nt)
+	return out, nil
+}
+
 // BakeGLB turns a generated mesh into a portable vertex-coloured GLB. texSize
 // remains an atlas hint for the explicit T2GLB_XATLAS mode. Geometry retains its
 // original polygon density. CPU-only; it can run while the GPU is idle.
@@ -381,6 +432,34 @@ func (e *engine) BakeGLB(m *meshData, texSize, componentFilter int) ([]byte, err
 	p := e.bakeGLB(unsafe.Pointer(&m.Verts[0]), int32(m.NVerts),
 		unsafe.Pointer(&m.Tris[0]), int32(m.NTris), pbr,
 		int32(texSize), int32(componentFilter),
+		unsafe.Pointer(&outLen), unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
+	if p == 0 {
+		return nil, fmt.Errorf("%s", cstr(errBuf))
+	}
+	defer e.freeBuffer(p)
+	out := make([]byte, outLen)
+	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(p)), int(outLen)))
+	return out, nil
+}
+
+// BakeProjectedGLB UV-unwraps replacement geometry and transfers the dense
+// source material per texel through the portable CGAL closest-surface backend.
+func (e *engine) BakeProjectedGLB(target, source *meshData, texSize, sourceComponentFilter int) ([]byte, error) {
+	if target == nil || target.NVerts == 0 || target.NTris == 0 ||
+		source == nil || source.NVerts == 0 || source.NTris == 0 || len(source.PBR) != 6*source.NVerts {
+		return nil, fmt.Errorf("empty projected GLB mesh or missing source PBR")
+	}
+	if !e.HasPrintRemesh() || e.bakeProjectedGLB == nil {
+		return nil, fmt.Errorf("PBR projection is unavailable (library was built without CGAL)")
+	}
+	var outLen int32
+	errBuf := make([]byte, 512)
+	p := e.bakeProjectedGLB(
+		unsafe.Pointer(&target.Verts[0]), int32(target.NVerts),
+		unsafe.Pointer(&target.Tris[0]), int32(target.NTris),
+		unsafe.Pointer(&source.Verts[0]), int32(source.NVerts),
+		unsafe.Pointer(&source.Tris[0]), int32(source.NTris),
+		unsafe.Pointer(&source.PBR[0]), int32(texSize), int32(sourceComponentFilter),
 		unsafe.Pointer(&outLen), unsafe.Pointer(&errBuf[0]), int32(len(errBuf)))
 	if p == 0 {
 		return nil, fmt.Errorf("%s", cstr(errBuf))

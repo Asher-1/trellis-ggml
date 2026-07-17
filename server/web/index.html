@@ -247,9 +247,32 @@
           </select>
         </div>
       </div>
+      <label class="idle-option" for="printwrap" id="printwraplabel"
+             title="rebuild as a watertight, intersection-free 2-manifold using CGAL Alpha Wrap">
+        <input id="printwrap" type="checkbox" disabled>
+        <span>watertight print wrap (CGAL)</span>
+      </label>
+      <div class="row" id="printwrapsettings" hidden>
+        <div>
+          <label for="wrapalpha" title="larger values close larger holes but remove more detail">detail size (% diagonal)</label>
+          <input id="wrapalpha" type="number" value="1" min="0.01" max="50" step="0.1">
+        </div>
+        <div>
+          <label for="wrapoffset" title="distance by which the new solid encloses the source">offset (% diagonal)</label>
+          <input id="wrapoffset" type="number" value="0.0333" min="0.001" max="50" step="0.001">
+        </div>
+        <div>
+          <label for="wraptex" title="resolution of the rebaked PBR texture maps">texture atlas</label>
+          <select id="wraptex">
+            <option value="1024">1024²</option>
+            <option value="2048" selected>2048²</option>
+            <option value="4096">4096²</option>
+          </select>
+        </div>
+      </div>
       <button id="regen" disabled title="run TRELLIS again from the full-resolution image saved on the server">regenerate from saved image</button>
       <div class="export-actions">
-        <button id="pexport" disabled>preview cleanup</button>
+        <button id="pexport" disabled>preview export</button>
         <button id="dglb" disabled>download GLB</button>
       </div>
       <div id="exportinfo">generate or open a mesh to enable export</div>
@@ -336,6 +359,15 @@ function applyRuntimeInfo(i) {
   $("backend").textContent = backendName
     + (i.models_loaded === false ? " · models unloaded" : "");
   $("unloadidle").checked = !!i.unload_idle;
+  const hasPrintWrap = !!i.print_remesh;
+  $("printwrap").disabled = !hasPrintWrap;
+  $("printwraplabel").title = hasPrintWrap
+    ? "rebuild as a watertight, intersection-free 2-manifold using CGAL Alpha Wrap"
+    : "unavailable: rebuild libtrellis2 with CGAL 5.5 or newer";
+  if (!hasPrintWrap) {
+    $("printwrap").checked = false;
+    $("printwrapsettings").hidden = true;
+  }
 }
 async function refreshRuntimeInfo() {
   const r = await fetch("/api/info");
@@ -703,7 +735,7 @@ function renderFrame(i) {
   if (!f) return;
   if (previewingExport) {
     previewingExport = false;
-    $("pexport").textContent = "preview cleanup";
+    $("pexport").textContent = "preview export";
   }
   if (f.kind === "voxel") viewer.setVoxels(f.res, f.coords);
   else viewer.setMesh(f.verts, f.normals, f.tris, f.pbr);
@@ -771,7 +803,7 @@ function meshDescription(m, prefix) {
 function resetExportState() {
   glbJobId = null; originalExportMesh = null; previewingExport = false;
   $("pexport").disabled = true;
-  $("pexport").textContent = "preview cleanup";
+  $("pexport").textContent = "preview export";
   $("dglb").disabled = true;
   $("dglb").textContent = "download GLB";
   $("regen").disabled = true;
@@ -784,18 +816,31 @@ function showOriginalExport() {
   viewer.setMesh(m.verts, m.normals, m.tris, m.pbr);
   $("meshinfo").textContent = meshDescription(m, "original · ");
   previewingExport = false;
-  $("pexport").textContent = "preview cleanup";
+  $("pexport").textContent = "preview export";
 }
 
 function exportQuery() {
-  return new URLSearchParams({
+  const q = new URLSearchParams({
     components: $("exportcomponents").value,
   });
+  if ($("printwrap").checked) {
+    q.set("print", "1");
+    q.set("alpha", $("wrapalpha").value);
+    q.set("offset", $("wrapoffset").value);
+    q.set("tex", $("wraptex").value);
+  }
+  return q;
 }
 
 function exportSettingsChanged() {
   if (previewingExport) showOriginalExport();
   if (!glbJobId) return;
+  if ($("printwrap").checked) {
+    $("exportinfo").textContent = originalExportMesh?.textured
+      ? "CGAL will rebuild a watertight mesh; download rebakes source PBR onto its new UV atlas"
+      : "CGAL will rebuild a watertight print mesh; this source has no material to transfer";
+    return;
+  }
   if (!originalExportMesh?.textured) {
     $("exportinfo").textContent =
       "warning: this saved mesh has no material data; its GLB will be geometry-only";
@@ -810,6 +855,13 @@ function exportSettingsChanged() {
 }
 
 $("exportcomponents").addEventListener("change", exportSettingsChanged);
+$("printwrap").addEventListener("change", () => {
+  $("printwrapsettings").hidden = !$("printwrap").checked;
+  exportSettingsChanged();
+});
+$("wrapalpha").addEventListener("change", exportSettingsChanged);
+$("wrapoffset").addEventListener("change", exportSettingsChanged);
+$("wraptex").addEventListener("change", exportSettingsChanged);
 
 async function loadMesh(id) {
   const r = await fetch("/api/mesh/" + id);
@@ -829,7 +881,7 @@ async function loadMesh(id) {
   buildTimeline();
   glbJobId = id;
   $("pexport").disabled = false;
-  $("pexport").textContent = "preview cleanup";
+  $("pexport").textContent = "preview export";
   $("dglb").disabled = false;
   $("dglb").textContent = "download GLB";
   $("regen").disabled = !(history.find(h => h.id === id)?.regeneratable);
@@ -880,8 +932,11 @@ $("pexport").addEventListener("click", async () => {
   if (!glbJobId) return;
   if (previewingExport) { showOriginalExport(); return; }
   const btn = $("pexport");
-  btn.disabled = true; btn.textContent = "preparing…";
-  setStatus("preparing component-cleanup preview…");
+  btn.disabled = true;
+  const wrapping = $("printwrap").checked;
+  btn.textContent = wrapping ? "wrapping…" : "preparing…";
+  setStatus(wrapping ? "constructing watertight CGAL Alpha Wrap…"
+                     : "preparing component-cleanup preview…");
   try {
     const r = await fetch(`/api/export-preview/${glbJobId}?${exportQuery()}`);
     if (!r.ok) throw new Error(await r.text());
@@ -889,16 +944,19 @@ $("pexport").addEventListener("click", async () => {
     viewer.setMesh(m.verts, m.normals, m.tris, m.pbr);
     $("meshinfo").textContent = meshDescription(m, "export preview · ");
     const cleaned = $("exportcomponents").value !== "all";
-    $("exportinfo").textContent = cleaned
-      ? `${m.nt.toLocaleString()} triangles remain after explicit component cleanup`
-      : `${m.nt.toLocaleString()} triangles · exact original mesh, no cleanup`;
+    $("exportinfo").textContent = wrapping
+      ? `${m.nt.toLocaleString()} triangles · watertight preview · ${originalExportMesh?.textured ? "PBR will be projected per texel on download" : "no source material"}`
+      : cleaned
+        ? `${m.nt.toLocaleString()} triangles remain after explicit component cleanup`
+        : `${m.nt.toLocaleString()} triangles · exact original mesh, no cleanup`;
     previewingExport = true;
     btn.textContent = "show original";
-    setStatus(cleaned ? "previewing component-cleaned export mesh"
-                      : "export preview matches the original mesh");
+    setStatus(wrapping ? "previewing watertight CGAL print mesh"
+                      : cleaned ? "previewing component-cleaned export mesh"
+                                : "export preview matches the original mesh");
   } catch (e) {
     setStatus("export preview failed: " + e.message, true);
-    btn.textContent = "preview cleanup";
+    btn.textContent = "preview export";
   } finally {
     btn.disabled = false;
   }
@@ -910,7 +968,8 @@ $("pexport").addEventListener("click", async () => {
 $("dglb").addEventListener("click", async () => {
   if (!glbJobId) return;
   const btn = $("dglb");
-  btn.disabled = true; btn.textContent = "baking GLB…";
+  btn.disabled = true;
+  btn.textContent = $("printwrap").checked ? "wrapping + baking…" : "baking GLB…";
   try {
     const query = exportQuery();
     const url = `/api/glb/${glbJobId}?${query}`;

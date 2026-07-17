@@ -49,6 +49,20 @@ bool prepare_mesh(const float * verts, int nv,
                   PreparedMesh & out,
                   std::string & err);
 
+// Optional CPU print-remesh path backed by CGAL Alpha Wrap 3. The ratios are
+// fractions of the component-filtered mesh's bounding-box diagonal. The result
+// is guaranteed by Alpha Wrap to be closed, oriented, intersection-free and
+// 2-manifold. The returned preview is geometry-only because wrapping creates a
+// new enclosing surface; mesh_to_projected_glb can rebake its source material.
+bool print_remesh_available();
+bool prepare_print_mesh(const float * verts, int nv,
+                        const int32_t * tris, int nt,
+                        const float * pbr,
+                        const MeshExportOptions & opt,
+                        float alpha_ratio, float offset_ratio,
+                        PreparedMesh & out,
+                        std::string & err);
+
 // Export a dense per-vertex-PBR mesh as a standard vertex-coloured GLB.
 //
 //   verts   3*nv  vertex positions (mesh/world space, as fdg::extract emits)
@@ -65,5 +79,18 @@ bool mesh_to_glb(const float * verts, int nv,
                  const MeshExportOptions & opt,
                  std::vector<uint8_t> & out,
                  std::string & err);
+
+// UV-unwrap `target` and bake its atlas by projecting each covered texel onto
+// the closest triangle of the dense PBR `source`.  Intended for assigning the
+// generated material to Alpha Wrap geometry; always uses xatlas and the CGAL
+// CPU closest-surface backend regardless of T2GLB_XATLAS.
+bool mesh_to_projected_glb(const float * target_verts, int target_nv,
+                           const int32_t * target_tris, int target_nt,
+                           const float * source_verts, int source_nv,
+                           const int32_t * source_tris, int source_nt,
+                           const float * source_pbr,
+                           const MeshExportOptions & opt,
+                           std::vector<uint8_t> & out,
+                           std::string & err);
 
 } // namespace t2glb

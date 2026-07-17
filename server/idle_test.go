@@ -101,7 +101,7 @@ func TestIdlePolicyWaitsForQueuedWork(t *testing.T) {
 
 func TestParseExportOptions(t *testing.T) {
 	def := parseExportOptions(httptest.NewRequest("GET", "/api/glb/job", nil))
-	if def.componentFilter != 2 || def.prepareKey() != "2" {
+	if def.componentFilter != 2 || def.printWrap || def.prepareKey() != "2" {
 		t.Fatalf("default export should preserve all components: %+v", def)
 	}
 	r := httptest.NewRequest("GET", "/api/glb/job?tex=1024&components=largest", nil)
@@ -111,6 +111,12 @@ func TestParseExportOptions(t *testing.T) {
 	}
 	if o.prepareKey() != "1" || o.glbKey() != "1024-1" {
 		t.Fatalf("unexpected export cache keys: %q %q", o.prepareKey(), o.glbKey())
+	}
+	wrapped := parseExportOptions(httptest.NewRequest("GET",
+		"/api/glb/job?print=1&alpha=2.5&offset=0.1", nil))
+	if !wrapped.printWrap || wrapped.alphaRatio != 0.025 || wrapped.offsetRatio != 0.001 ||
+		wrapped.prepareKey() == def.prepareKey() {
+		t.Fatalf("print-wrap options were not parsed/cached independently: %+v", wrapped)
 	}
 }
 

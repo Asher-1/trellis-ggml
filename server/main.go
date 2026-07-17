@@ -107,8 +107,8 @@ type job struct {
 	keyframes    int      // intermediate shape-SLAT mesh keyframes to record (0 = off)
 	previews     [][]byte // every preview blob, in order; served by /api/preview?seq=
 	mesh         *meshData
-	exportMesh   *meshData  // cached component-cleanup preview for exportKey
-	exportKey    string     // component mode
+	exportMesh   *meshData  // cached component-cleanup/print-wrap preview
+	exportKey    string     // component mode + optional Alpha Wrap parameters
 	glb          []byte     // cached last GLB bake
 	glbKey       string     // "tex-components" the cached GLB was baked with
 	exportMu     sync.Mutex // serializes large export preparation/bakes per job
@@ -719,12 +719,17 @@ func writeMeshBinary(w io.Writer, mesh *meshData) error {
 type exportOptions struct {
 	textureSize     int
 	componentFilter int
+	printWrap       bool
+	alphaRatio      float32
+	offsetRatio     float32
 }
 
 func parseExportOptions(r *http.Request) exportOptions {
 	o := exportOptions{
 		textureSize:     2048,
 		componentFilter: 2, // safe default: preserve every connected component
+		alphaRatio:      0.01,
+		offsetRatio:     0.01 / 30,
 	}
 	if n := int(formUint(r, "tex", uint64(o.textureSize))); n >= 256 && n <= 4096 {
 		o.textureSize = n
@@ -735,11 +740,21 @@ func parseExportOptions(r *http.Request) exportOptions {
 	case "largest":
 		o.componentFilter = 1
 	}
+	o.printWrap = r.FormValue("print") == "1" || r.FormValue("print") == "true"
+	if pct := formFloat(r, "alpha", o.alphaRatio*100); pct >= 0.01 && pct <= 50 {
+		o.alphaRatio = pct / 100
+	}
+	if pct := formFloat(r, "offset", o.offsetRatio*100); pct >= 0.001 && pct <= 50 {
+		o.offsetRatio = pct / 100
+	}
 	return o
 }
 
 func (o exportOptions) prepareKey() string {
-	return strconv.Itoa(o.componentFilter)
+	if !o.printWrap {
+		return strconv.Itoa(o.componentFilter)
+	}
+	return fmt.Sprintf("%d-wrap-%g-%g", o.componentFilter, o.alphaRatio, o.offsetRatio)
 }
 
 func (o exportOptions) glbKey() string {
@@ -749,7 +764,7 @@ func (o exportOptions) glbKey() string {
 func (s *server) preparedExportMesh(j *job, o exportOptions) (*meshData, error) {
 	// Keep-all preview is the saved source object itself: no copying, normal
 	// recomputation, topology cleanup, or other opportunity to alter it.
-	if o.componentFilter == 2 {
+	if o.componentFilter == 2 && !o.printWrap {
 		return s.loadJobMesh(j)
 	}
 	key := o.prepareKey()
@@ -764,7 +779,12 @@ func (s *server) preparedExportMesh(j *job, o exportOptions) (*meshData, error) 
 	if err != nil {
 		return nil, err
 	}
-	mesh, err := s.eng.PrepareMesh(source, o.componentFilter)
+	var mesh *meshData
+	if o.printWrap {
+		mesh, err = s.eng.PreparePrintMesh(source, o.componentFilter, o.alphaRatio, o.offsetRatio)
+	} else {
+		mesh, err = s.eng.PrepareMesh(source, o.componentFilter)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -823,8 +843,9 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	w.Write(blob)
 }
 
-// handleGLB writes the exact prepared preview mesh into a vertex-coloured GLB.
-// Both prepared geometry and final GLB are cached by their export settings.
+// handleGLB writes the exact prepared preview mesh into a GLB. Print wraps with
+// source PBR take the upstream-style UV-atlas reprojection path; ordinary dense
+// meshes retain their compact vertex material. Both stages are settings-cached.
 func (s *server) handleGLB(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "GET or HEAD only", http.StatusMethodNotAllowed)
@@ -851,7 +872,19 @@ func (s *server) handleGLB(w http.ResponseWriter, r *http.Request) {
 			return glb, nil
 		}
 		started := time.Now()
-		glb, err = s.eng.BakeGLB(mesh, o.textureSize, 2 /*already prepared*/)
+		if o.printWrap {
+			source, sourceErr := s.loadJobMesh(j)
+			if sourceErr != nil {
+				return nil, fmt.Errorf("load projection source: %w", sourceErr)
+			}
+			if len(source.PBR) == 6*source.NVerts {
+				glb, err = s.eng.BakeProjectedGLB(mesh, source, o.textureSize, o.componentFilter)
+			} else {
+				glb, err = s.eng.BakeGLB(mesh, o.textureSize, 2 /*already prepared*/)
+			}
+		} else {
+			glb, err = s.eng.BakeGLB(mesh, o.textureSize, 2 /*already prepared*/)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("bake glb: %w", err)
 		}
@@ -913,6 +946,7 @@ func (s *server) info() map[string]interface{} {
 		"models_loaded":     loaded,
 		"unload_idle":       unloadIdle,
 		"generation_active": generationActive,
+		"print_remesh":      s.eng.HasPrintRemesh(),
 		"defaults": map[string]interface{}{
 			"steps":         12,
 			"guidance":      7.5,
