@@ -677,17 +677,31 @@ bool prepare_print_mesh(const float * verts, int nv,
                         float alpha_ratio, float offset_ratio,
                         PreparedMesh & out,
                         std::string & err) {
-    (void) pbr; // new Alpha Wrap vertices cannot retain source vertex attributes
+    // Carry the source material through component filtering so it can be sampled
+    // onto the wrap for a textured preview (source.pbr stays aligned with
+    // source.verts/source.tris; empty when the caller passed no material).
     PreparedMesh source;
-    if (!prepare_mesh(verts, nv, tris, nt, nullptr, opt, source, err)) return false;
+    if (!prepare_mesh(verts, nv, tris, nt, pbr, opt, source, err)) return false;
 
     PreparedMesh wrapped;
     if (!t2print::alpha_wrap(source.verts, source.tris, alpha_ratio, offset_ratio,
                              wrapped.verts, wrapped.normals, wrapped.tris, err))
         return false;
-    // Alpha Wrap constructs new offset vertices. Retaining source per-vertex
-    // attributes would silently attach colors/materials to unrelated points.
-    wrapped.pbr.clear();
+    // Alpha Wrap constructs entirely new offset vertices, so source per-vertex
+    // attributes cannot be carried directly. When the source is textured, sample
+    // its material at each wrap vertex by closest-surface projection — the same
+    // transfer the GLB download bakes per texel, here per vertex for a cheap,
+    // approximate preview. Projection is best-effort: on failure the wrap still
+    // previews untextured rather than aborting the print preview entirely.
+    if (!source.pbr.empty() && source.pbr.size() == source.verts.size() / 3 * 6) {
+        std::string perr;
+        if (!t2print::project_pbr(source.verts, source.tris, source.pbr,
+                                  wrapped.verts, wrapped.pbr, perr)) {
+            wrapped.pbr.clear();
+        }
+    } else {
+        wrapped.pbr.clear();
+    }
     out = std::move(wrapped);
     return true;
 }

@@ -728,8 +728,8 @@ func parseExportOptions(r *http.Request) exportOptions {
 	o := exportOptions{
 		textureSize:     2048,
 		componentFilter: 2, // safe default: preserve every connected component
-		alphaRatio:      0.01,
-		offsetRatio:     0.01 / 30,
+		alphaRatio:      0.005,      // detail size: 0.5% of the bbox diagonal
+		offsetRatio:     0.005 / 30, // shell standoff ~alpha/30 (CGAL guideline)
 	}
 	if n := int(formUint(r, "tex", uint64(o.textureSize))); n >= 256 && n <= 4096 {
 		o.textureSize = n

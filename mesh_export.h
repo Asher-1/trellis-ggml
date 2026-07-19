@@ -52,8 +52,9 @@ bool prepare_mesh(const float * verts, int nv,
 // Optional CPU print-remesh path backed by CGAL Alpha Wrap 3. The ratios are
 // fractions of the component-filtered mesh's bounding-box diagonal. The result
 // is guaranteed by Alpha Wrap to be closed, oriented, intersection-free and
-// 2-manifold. The returned preview is geometry-only because wrapping creates a
-// new enclosing surface; mesh_to_projected_glb can rebake its source material.
+// 2-manifold. Wrapping creates a new enclosing surface, so a textured source is
+// sampled onto the wrap vertices (approximate per-vertex preview); the sharper
+// per-texel rebake stays in mesh_to_projected_glb for the GLB download.
 bool print_remesh_available();
 bool prepare_print_mesh(const float * verts, int nv,
                         const int32_t * tris, int nt,

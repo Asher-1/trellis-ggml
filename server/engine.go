@@ -383,8 +383,9 @@ func (e *engine) HasPrintRemesh() bool {
 
 // PreparePrintMesh component-filters and wraps arbitrary source topology in a
 // watertight, oriented, intersection-free 2-manifold. Ratios are fractions of
-// the source bounding-box diagonal. Alpha Wrap creates new geometry, so the
-// returned preview has no PBR stream; GLB download rebakes it per texel.
+// the source bounding-box diagonal. Alpha Wrap creates new geometry, so when the
+// source is textured the material is projected onto the wrap vertices for an
+// approximate per-vertex preview; the GLB download rebakes it sharper per texel.
 func (e *engine) PreparePrintMesh(m *meshData, componentFilter int, alphaRatio, offsetRatio float32) (*meshData, error) {
 	if m == nil || m.NVerts == 0 || m.NTris == 0 {
 		return nil, fmt.Errorf("empty mesh")
@@ -413,6 +414,9 @@ func (e *engine) PreparePrintMesh(m *meshData, componentFilter int, alphaRatio, 
 	out.Verts = copyFloats(e.meshVerts(r), 3*nv)
 	out.Normals = copyFloats(e.meshNormals(r), 3*nv)
 	out.Tris = copyInts(e.meshTris(r), 3*nt)
+	if e.meshHasPBR(r) != 0 {
+		out.PBR = copyFloats(e.meshPBR(r), 6*nv)
+	}
 	return out, nil
 }
 
