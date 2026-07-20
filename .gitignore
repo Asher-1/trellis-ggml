@@ -1,6 +1,7 @@
 # build output
 /build/
 /build-*/
+/.deps/
 
 # scratch / generated artifacts (meshes, latents, occupancy grids)
 /tmp/

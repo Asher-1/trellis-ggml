@@ -16,7 +16,9 @@ docker build -f docker/Dockerfile.demo -t trellis2-demo docker
 
 docker run --rm -v "$ROOT":/work -w /work -e GOCACHE=/tmp/gocache trellis2-demo bash -c '
   cmake -B build-cuda-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
-        -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_SHARED_LIBS=ON >/dev/null 2>&1 &&
+        -DCMAKE_CUDA_ARCHITECTURES=120 -DBUILD_SHARED_LIBS=ON \
+        -DTRELLIS2_FETCH_PRINT_REMESH_DEPS=ON \
+        -DTRELLIS2_PRINT_REMESH_DEPS_DIR=/work/.deps/print-remesh >/dev/null 2>&1 &&
   cmake --build build-cuda-shared -j"$(nproc)" &&
   cd server && CGO_ENABLED=0 go build -o trellis2-server-linux .'
 

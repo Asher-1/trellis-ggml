@@ -299,8 +299,19 @@ cmake --build build -j
 
 CGAL is auto-detected. Install CGAL 5.5 or newer before configuring to enable
 the portable CPU print-remesh backend, or pass `-DTRELLIS2_CGAL=OFF` to disable
-the probe explicitly. CMake prints whether Alpha Wrap was enabled. The standard
-demo container already includes CGAL 6.1.1.
+the probe explicitly. CMake prints whether Alpha Wrap was enabled.
+
+For reproducible builds without system CGAL/Boost packages, let trellis2.cpp
+fetch its checksum-pinned header set:
+
+```sh
+cmake -B build -DTRELLIS2_FETCH_PRINT_REMESH_DEPS=ON
+```
+
+`TRELLIS2_PRINT_REMESH_DEPS_DIR` can point multiple build variants at one
+shared cache. The versions, upstream SHA-256 digests, fetch behavior, demo, and
+scheduled update PRs are all owned by this repository; downstream projects
+only need to pin a tested trellis2.cpp commit.
 
 If you already cloned without `--recursive`:
 

@@ -7,18 +7,12 @@
 # Usage:  see scripts/demo.sh
 FROM trellis2-ref
 
-# Ubuntu 22.04 only packages CGAL 5.4, while Alpha Wrap was introduced in 5.5.
-# Install the current header-only library bundle so the standard demo build
-# exposes the optional watertight print-remesh control.
-ARG CGAL_VERSION=6.1.1
+# The mounted source tree's CMake fetches its own pinned CGAL + Boost header
+# set. The image only provides the archive tools, so dependency versions have
+# one owner instead of drifting between the demo and downstream builds.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libboost-dev libgmp-dev libmpfr-dev xz-utils \
+        ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
-ADD https://github.com/CGAL/cgal/releases/download/v${CGAL_VERSION}/CGAL-${CGAL_VERSION}-library.tar.xz /tmp/cgal.tar.xz
-RUN mkdir -p /opt/cgal \
-    && tar -xJf /tmp/cgal.tar.xz --strip-components=1 -C /opt/cgal \
-    && rm /tmp/cgal.tar.xz
-ENV CGAL_DIR=/opt/cgal
 
 ADD https://go.dev/dl/go1.24.4.linux-amd64.tar.gz /tmp/go.tgz
 RUN tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz

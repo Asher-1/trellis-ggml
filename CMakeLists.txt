@@ -75,7 +75,31 @@ target_compile_features(trellis2 PUBLIC cxx_std_14)
 # intersection-free 2-manifolds for printing. Auto-detect it so ordinary builds
 # retain no CGAL dependency; the C API reports whether the backend is present.
 option(TRELLIS2_CGAL "Enable CGAL Alpha Wrap print remeshing when available" ON)
+option(TRELLIS2_FETCH_PRINT_REMESH_DEPS
+    "Fetch the project-pinned CGAL and Boost headers for print remeshing" OFF)
+set(TRELLIS2_PRINT_REMESH_DEPS_DIR "${CMAKE_BINARY_DIR}/_deps/print-remesh" CACHE PATH
+    "Directory containing project-pinned CGAL and Boost headers")
 if(TRELLIS2_CGAL)
+    if(TRELLIS2_FETCH_PRINT_REMESH_DEPS)
+        find_program(TRELLIS2_BASH_EXECUTABLE bash)
+        if(NOT TRELLIS2_BASH_EXECUTABLE)
+            message(FATAL_ERROR "bash is required to fetch print-remesh dependencies")
+        endif()
+        execute_process(
+            COMMAND "${TRELLIS2_BASH_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/fetch_print_remesh_deps.sh"
+                    "${TRELLIS2_PRINT_REMESH_DEPS_DIR}"
+            RESULT_VARIABLE TRELLIS2_PRINT_REMESH_DEPS_RESULT)
+        if(NOT TRELLIS2_PRINT_REMESH_DEPS_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to fetch pinned print-remesh dependencies")
+        endif()
+        set(CGAL_DIR "${TRELLIS2_PRINT_REMESH_DEPS_DIR}/cgal" CACHE PATH
+            "CGAL package directory" FORCE)
+        set(Boost_INCLUDE_DIR "${TRELLIS2_PRINT_REMESH_DEPS_DIR}/boost" CACHE PATH
+            "Boost header directory" FORCE)
+        set(Boost_DIR "${TRELLIS2_PRINT_REMESH_DEPS_DIR}/boost-cmake" CACHE PATH
+            "Header-only Boost CMake package directory" FORCE)
+    endif()
     find_package(CGAL 5.5 QUIET)
     if(CGAL_FOUND)
         target_link_libraries(trellis2 PRIVATE CGAL::CGAL)
@@ -83,6 +107,8 @@ if(TRELLIS2_CGAL)
         target_compile_features(trellis2 PRIVATE cxx_std_17)
         set(TRELLIS2_HAVE_CGAL ON)
         message(STATUS "CGAL Alpha Wrap print remeshing: enabled")
+    elseif(TRELLIS2_FETCH_PRINT_REMESH_DEPS)
+        message(FATAL_ERROR "The project-pinned CGAL print-remesh dependencies were fetched but not found")
     else()
         message(STATUS "CGAL Alpha Wrap print remeshing: unavailable (CGAL >= 5.5 not found)")
     endif()
