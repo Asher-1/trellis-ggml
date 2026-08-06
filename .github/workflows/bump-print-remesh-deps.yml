@@ -1,0 +1,44 @@
+name: Bump print-remesh dependencies
+
+on:
+  schedule:
+    - cron: '17 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Update pins and validate the build
+        id: bump
+        run: |
+          .github/bump_print_remesh_deps.sh
+          scripts/fetch_print_remesh_deps.sh /tmp/trellis2-print-remesh-deps
+          cmake -S . -B /tmp/trellis2-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DTRELLIS2_BUILD_EXAMPLES=OFF \
+            -DTRELLIS2_FETCH_PRINT_REMESH_DEPS=ON \
+            -DTRELLIS2_PRINT_REMESH_DEPS_DIR=/tmp/trellis2-print-remesh-deps
+          cmake --build /tmp/trellis2-build --target trellis2 --parallel 2
+          {
+            echo 'message<<EOF'
+            cat print_remesh_deps_message.txt
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          echo "version=$(cat print_remesh_deps_version.txt)" >> "$GITHUB_OUTPUT"
+          rm print_remesh_deps_message.txt print_remesh_deps_version.txt
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          commit-message: 'chore: update print-remesh dependencies'
+          title: 'chore: update print-remesh dependencies to ${{ steps.bump.outputs.version }}'
+          branch: update/print-remesh-dependencies
+          body: ${{ steps.bump.outputs.message }}

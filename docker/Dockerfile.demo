@@ -1,0 +1,21 @@
+# Demo/runtime image: the reference image (CUDA 12.8 runtime + toolchain)
+# plus a Go toolchain, so both libtrellis2.so (CUDA) and the Go demo server
+# build against the SAME glibc/libstdc++ that run them. NixOS host binaries
+# don't survive inside the container (different dynamic loader), hence this.
+#
+# Build:  docker build -f docker/Dockerfile.demo -t trellis2-demo docker
+# Usage:  see scripts/demo.sh
+FROM trellis2-ref
+
+# The mounted source tree's CMake fetches its own pinned CGAL + Boost header
+# set. The image only provides the archive tools, so dependency versions have
+# one owner instead of drifting between the demo and downstream builds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+ADD https://go.dev/dl/go1.24.4.linux-amd64.tar.gz /tmp/go.tgz
+RUN tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:$PATH
+# go.sum is committed; `go build` fetches the single dep (purego) on demand.
+# A committed server/vendor/ dir (if present) is used automatically.
