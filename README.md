@@ -68,6 +68,13 @@ safetensors download and the conversion step entirely:
 - [`TRELLIS-image-large-GGUF`](https://huggingface.co/LocalAI-io/TRELLIS-image-large-GGUF) — MIT
 - [`dinov3-vitl16-pretrain-lvd1689m-GGUF`](https://huggingface.co/LocalAI-io/dinov3-vitl16-pretrain-lvd1689m-GGUF) — DINOv3 License (Built with DINOv3)
 
+> Why HuggingFace and not git/GitHub Releases? Several GGUFs exceed 2 GB (e.g.
+> every 1.3B `*_f16.gguf` is ~2.4 GB), which GitHub Releases caps at 2 GiB per
+> file and plain git warns at 100 MB. HuggingFace has no such per-file limit and
+> is the standard channel for model weights, so the weights are hosted there and
+> fetched at runtime (`models/` and `ggufs/` are git-ignored). The GitHub repo
+> stays lean and always points at the latest published HF artifacts.
+
 **Developers** who need the f32 validation variants, or who want to regenerate the
 GGUFs from source, use the original flow instead: `scripts/download_models.sh` (HF
 safetensors → `models/`, ~7 GB) then `docker run … trellis2-ref bash
@@ -162,6 +169,9 @@ conditioned on a 1024-res DINOv3 encode) and the same decoder at 1024³ — a
 ~5M-vertex mesh. The ~49k-token HR attention only fits in VRAM via flash
 attention (`sdpa_auto`); see [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
+Vendored submodules and the patches applied to them (single shared ggml + RMBG
+reuse) are documented in [docs/SUBMODULES.md](docs/SUBMODULES.md).
+
 The neural components are validated tap-by-tap against the PyTorch reference,
 with separate integration regressions for subdivision guidance, sparse material
 sampling, and GLB alpha preservation — see
@@ -181,7 +191,7 @@ input image, ensuring a fair comparison.
 |---------|-----------|------------|
 | **PyTorch CUDA** (upstream) | 317.9 s | baseline |
 | **ggml CUDA** (this project) | 142.7 s | **2.2× faster** |
-| **ggml Vulkan** | 136.1 s | **2.3× faster** |
+| **ggml Vulkan** | 176.8 s | **1.8× faster** |
 | **ggml CPU** | 2652.6 s | 8.3× slower |
 
 ![Speed comparison](docs/benchmark_speed_comparison.png)
@@ -229,6 +239,9 @@ PyTorch CUDA (1.46M verts), ggml CUDA (1.86M verts), ggml Vulkan (1.86M verts).
 
 Full benchmark data, charts, and analysis are available in
 [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
+
+Per-model reference (architecture, params, role in the pipeline, per-stage
+latency, precision notes) is in [`docs/MODELS.md`](docs/MODELS.md).
 
 ## Components
 

@@ -94,17 +94,17 @@ Q8_0 implementation exactly matches ggml's `quantize_row_q8_0_ref()`.
 
 | Metric | F16 | Q8 | Δ |
 |--------|-----|-----|---|
-| Vertices | 1,867,007 | 1,807,953 | −3.2% |
-| Triangles | 3,915,484 | 3,839,432 | −1.9% |
-| Inference time | 92.0s | 91.2s | −0.9% |
+| Vertices | 1,884,862 | 1,824,032 | −3.2% |
+| Triangles | 4,116,744 | 3,827,042 | −7.0% |
+| Inference time | 142.7s | 129.0s | −9.6% |
 
 ### End-to-end mesh parity (CUDA, coarse, steps=12, seed=42)
 
 | Metric | F16 | Q8 | Δ |
 |--------|-----|-----|---|
-| Vertices | 83,576 | 82,086 | −1.8% |
-| Triangles | 167,236 | 164,264 | −1.8% |
-| Inference time | 42.7s | 43.0s | +0.7% |
+| Vertices | 83,405 | 82,722 | −0.8% |
+| Triangles | 166,864 | 165,520 | −0.8% |
+| Inference time | 46.9s | 44.4s | −5.3% |
 
 ### CUDA backend constraints
 

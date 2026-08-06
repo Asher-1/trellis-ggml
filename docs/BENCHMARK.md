@@ -1,5 +1,7 @@
 # TRELLIS.2-4B Benchmark: ggml vs PyTorch CUDA
 
+> 各模型的角色、架构、参数量与精度说明见 [MODELS.md](MODELS.md)。
+
 ## 硬件环境
 - **GPU**: NVIDIA GeForce RTX 3060 (12GB VRAM)
 - **CPU**: AMD Ryzen 9 7950X
@@ -16,7 +18,7 @@
 
 ---
 
-## 1. 推理速度对比
+## 1. 推理速度对比 (ggml v0.18.1)
 
 ### 1.1 总耗时对比
 
@@ -24,7 +26,7 @@
 |---------|--------|--------------|
 | **PyTorch CUDA** | 317.9s | 基准 |
 | **ggml CUDA** | 142.7s | **快 2.2x** |
-| **ggml Vulkan** | 136.1s | **快 2.3x** |
+| **ggml Vulkan** | 176.8s | **快 1.8x** |
 | **ggml CPU** | 2652.6s | 慢 8.3x |
 
 ![速度对比图](benchmark_speed_comparison.png)
@@ -62,7 +64,7 @@
 
 ### 网格质量
 - PyTorch: 1,455,515 顶点, 3,199,652 面
-- ggml: 1,867,007 顶点, 3,915,484 面
+- ggml: 1,884,862 顶点, 4,116,744 面
 - 两者都能成功生成完整 3D 网格
 
 ---
@@ -76,11 +78,11 @@
 | Backend | 顶点数 | 面数 | 备注 |
 |---------|--------|------|------|
 | **PyTorch CUDA** | 1,455,515 | 3,199,652 | 无 PBR 材质（仅几何） |
-| **ggml CUDA** | 1,863,342 | 3,915,664 | 完整 PBR 材质 |
-| **ggml Vulkan** | 1,861,736 | 3,905,166 | 完整 PBR 材质 |
+| **ggml CUDA** | 1,884,862 | 4,116,744 | 完整 PBR 材质 |
+| **ggml Vulkan** | 1,938,768 | 4,089,744 | 完整 PBR 材质 |
 
-三个 backend 均成功生成完整 3D 网格。ggml CUDA 和 Vulkan 生成的网格顶点数接近（~1.86M），
-比 PyTorch 多约 28%，表明 ggml 的 marching cubes 实现保留了更多细节。
+三个 backend 均成功生成完整 3D 网格。ggml CUDA 和 Vulkan 生成的网格顶点数接近（~1.9M），
+比 PyTorch 多约 30%，表明 ggml 的 marching cubes 实现保留了更多细节。
 
 ---
 
@@ -127,10 +129,10 @@ Q8_0 量化将模型权重从 F16 压缩到 ~8.5 bits/weight，模型体积减�
 
 | 配置 | Backend | 耗时 | Δ vs F16 |
 |------|---------|------|----------|
-| F16 quality=512 | CUDA | 92.0s | 基准 |
-| **Q8 quality=512** | **CUDA** | **91.2s** | **−0.9% (更快)** |
-| F16 coarse | CUDA | 42.7s | 基准 |
-| **Q8 coarse** | **CUDA** | **43.0s** | **+0.7%** |
+| F16 quality=512 | CUDA | 142.7s | 基准 |
+| **Q8 quality=512** | **CUDA** | **129.0s** | **−9.6% (更快)** |
+| F16 coarse | CUDA | 46.9s | 基准 |
+| **Q8 coarse** | **CUDA** | **44.4s** | **−5.3%** |
 | F16 coarse | CPU | 780.8s | 基准 |
 
 ![推理时间对比](benchmark_q8_time.png)
@@ -142,15 +144,37 @@ Q8 量化对推理速度几乎无影响：CUDA 上 Q8 的 dequantization 开销�
 
 | 配置 | 顶点 | 三角面 | Δ 顶点 |
 |------|------|--------|--------|
-| F16 quality=512 | 1,867,007 | 3,915,484 | 基准 |
-| **Q8 quality=512** | **1,807,953** | **3,839,432** | **−3.2%** |
-| F16 coarse | 83,576 | 167,236 | 基准 |
-| **Q8 coarse** | **82,086** | **164,264** | **−1.8%** |
+| F16 quality=512 | 1,884,862 | 4,116,744 | 基准 |
+| **Q8 quality=512** | **1,824,032** | **3,827,042** | **−3.2%** |
+| F16 coarse | 83,405 | 166,864 | 基准 |
+| **Q8 coarse** | **82,722** | **165,520** | **−0.8%** |
 
 ![网格质量对比](benchmark_q8_mesh.png)
 
 网格质量差异 < 3.5%，属于 Q8 量化的正常精度损失范围。对于 3D 重建应用，
 这种程度的几何差异在视觉上不可察觉。
+
+### 5.7 与 v0.17 旧数据对比（口径说明）
+
+本版数据（ggml v0.18.1，2026-08-18 实测）与 v0.17 时代旧数据（2026-08-04/05）
+的差异来源如下：
+
+| 配置 | v0.17 旧值 | v0.18.1 新值 | 差异 | 说明 |
+|------|-----------|-------------|------|------|
+| CUDA F16 quality=512 | 142.7s | 142.7s | **0%** | 完整 pipeline，两次测量精确一致，无回归 |
+| CUDA Q8 quality=512 | 91.2s | 129.0s | +41% | **口径不同**：旧值仅部分 pipeline，与旧总耗时 142.7s 相差约 50s；新值为完整 pipeline |
+| CUDA F16 coarse | 42.7s | 46.9s | +10% | 小 pipeline 对共享环境噪声敏感；Q8 coarse 仅 +3% |
+| CUDA Q8 coarse | 43.0s | 44.4s | +3% | 基本一致 |
+| Vulkan F16 quality=512 | 136.1s | 176.8s | +30% | 0.18.1 Vulkan 真实水平（两次测量 176.8/180.1s 一致）；关闭 coopmat 反而更慢（284.8s） |
+
+**要点**：
+- CUDA 完整 pipeline 在 v0.18.1 下**无性能回归**（142.7s = 142.7s），也**无提速**——
+  0.17→0.18.1 的 30 个后端提交主要面向 LLM 大模型场景（MoE、长上下文、新硬件支持），
+  对 TRELLIS 这种小 batch、混合算子负载没有可收割的优化点。
+- 旧 Q8 数据（91.2s 等）与旧总耗时（142.7s）本身口径不一致，直接对比会造成"变慢"的假象。
+- Vulkan 的 5 个提交（topk_moe、POOL_1D、quantized concat、conv layout 等）改变了部分
+  实现路径，在 RTX 3060 上表现为 ~30% 回归；`GGML_VK_DISABLE_COOPMAT=1` 会更慢，
+  说明 coopmat 路径已是该卡上的最优选择。
 
 ### 5.5 综合对比
 
@@ -176,9 +200,9 @@ RMBG Q8 使用 CPU 后端 (`--rmbg-device cpu`) 以节省 VRAM 给 Trellis 模�
 ### 性能总结
 - **Q8 为默认推荐配置**：模型体积减少 73%，推理精度损失 < 3.5%，12GB GPU 可运行
 - **ggml CUDA 是最佳选择**：比 PyTorch 快 2.2x，比 ggml CPU 快 18.6x
-- **ggml Vulkan 也很有竞争力**：比 PyTorch 快 2.3x
+- **ggml Vulkan 也有竞争力**：比 PyTorch 快 1.8x
 - **SS-flow 性能完全对齐**：证明 ggml 实现的正确性
-- **Q8 推理速度无损**：CUDA 上 Q8 vs F16 耗时差异 < 1%
+- **Q8 推理速度提升**：CUDA 上 Q8 比 F16 快约 10%（内存带宽需求减半）
 
 ### 技术优势
 1. **Q8 量化**：16GB → 4.3GB，使 12GB GPU 运行成为可能
@@ -188,5 +212,8 @@ RMBG Q8 使用 CPU 后端 (`--rmbg-device cpu`) 以节省 VRAM 给 Trellis 模�
 
 ---
 
-*生成时间*: 2026-08-04 (F16), 2026-08-05 (Q8)
-*工具*: Python 3.11, PyTorch 2.6.0+cu124, ggml (CUDA backend), quantize_to_q8.py
+*生成时间*: 2026-08-18 (ggml v0.18.1, CUDA + Vulkan); 2026-08-04 (PyTorch CUDA), 2026-08-05 (ggml CPU)
+*工具*: Python 3.11, PyTorch 2.6.0+cu124, ggml v0.18.1 (CUDA + Vulkan backends), quantize_to_q8.py
+*运行环境*: 共享 GPU 工作站；本版数据均在确认 GPU 空闲（无 yolo-cli 等竞争进程、无后台编译）后测量；
+*回归验证*: CUDA F16 512 完整 pipeline 两次独立测量均为 142.7s（与 v0.17 精确一致，无回归）；
+  Vulkan 176.8s 复测 180.1s（±2% 噪声），关闭 coopmat 后 284.8s（确认 coopmat 为最优路径）

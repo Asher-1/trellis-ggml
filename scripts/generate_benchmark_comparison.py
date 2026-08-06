@@ -31,9 +31,9 @@ BACKEND_DATA = {
         'ss_flow_s': 19.8,
         'shape_slat_s': 7.0,
         'shape_decode_s': 9.8,
-        'vertices': 1867007,
-        'faces': 3915484,
-        'mesh_path': 'outputs/pbr_e2e/pbr_official_T.t2mesh',
+        'vertices': 1884862,
+        'faces': 4116744,
+        'mesh_path': '/tmp/bench_cuda_f16_512_clean.t2mesh',
     },
     'ggml CPU': {
         'total_s': 2652.6,
@@ -47,15 +47,15 @@ BACKEND_DATA = {
         'mesh_path': None,
     },
     'ggml Vulkan': {
-        'total_s': 136.1,
+        'total_s': 176.8,
         'gpu_stages_s': 0,
         'dino_s': 0,
         'ss_flow_s': 0,
         'shape_slat_s': 0,
         'shape_decode_s': 0,
-        'vertices': 1625650,
-        'faces': 0,  # Not available
-        'mesh_path': None,
+        'vertices': 1938768,
+        'faces': 4089744,  # Available from Vulkan run
+        'mesh_path': '/tmp/bench_vk_f16_512.t2mesh',
     },
 }
 

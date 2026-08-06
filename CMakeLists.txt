@@ -39,50 +39,125 @@ if(APPLE AND TRELLIS2_METAL AND NOT TRELLIS2_USE_EXTERNAL_GGML)
 endif()
 
 # ---------------------------------------------------------------------
-# Submodule patches
+# Submodule materialization + patches
 #
 # The bundled ggml and RMBG-2.0-GGML submodules carry a few required fixes
-# (CUDA Q8_0->Q8_0 copy support, RMBG CMake/stb handling). These are applied
-# automatically at configure time so a fresh clone builds without manual steps.
-# The functions are idempotent: if a patch is already applied they no-op.
-# Upstream submodule sources are left untouched on disk as git state; the patch
-# is the source of truth for the fix.
+# (CUDA Q8_0->Q8_0 copy support, RMBG CMake/stb handling). Instead of
+# patching the submodule working trees in place, `git archive` materializes
+# the pinned commit into the build tree and the patches are applied there.
+# Submodules stay pristine; the patches in patches/ are the source of truth.
+# The ggml-rmbg-ops.patch is synced automatically from the RMBG submodule's
+# own third_party/ggml-rmbg.patch, so an upstream update needs no manual copy.
 # ---------------------------------------------------------------------
-function(_trellis_apply_patch subdir patch)
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/.git")
-        return()
+function(_trellis_materialize_submodule out_var subdir)
+    set(_src "${CMAKE_CURRENT_SOURCE_DIR}/${subdir}")
+    if(NOT EXISTS "${_src}/.git")
+        message(FATAL_ERROR "${subdir} submodule missing. Run:\n"
+            "  git submodule update --init --recursive ${subdir}")
     endif()
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${patch}")
-        return()
-    endif()
+    find_package(Git REQUIRED)
     execute_process(
-        COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}/${subdir}" apply --check -R "${CMAKE_CURRENT_SOURCE_DIR}/${patch}"
-        RESULT_VARIABLE _rev_res
-        OUTPUT_QUIET ERROR_QUIET)
-    if(_rev_res EQUAL 0)
-        return() # already applied
+        COMMAND "${GIT_EXECUTABLE}" -C "${_src}" rev-parse HEAD
+        OUTPUT_VARIABLE _commit
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _rev_res)
+    if(NOT _rev_res EQUAL 0)
+        message(FATAL_ERROR "Failed to read ${subdir} submodule commit")
     endif()
-    execute_process(
-        COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}/${subdir}" apply "${CMAKE_CURRENT_SOURCE_DIR}/${patch}"
-        RESULT_VARIABLE _apply_res
-        OUTPUT_VARIABLE _apply_out ERROR_VARIABLE _apply_out)
-    if(NOT _apply_res EQUAL 0)
-        message(WARNING "Failed to apply ${patch}: ${_apply_out}")
-    else()
-        message(STATUS "Applied submodule patch: ${patch}")
+    # Fingerprint = commit + every patch's SHA256; any change re-materializes.
+    set(_stamp_parts "${_commit}")
+    set(_patches)
+    foreach(_p IN LISTS ARGN)
+        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_p}")
+            message(FATAL_ERROR "Required patch missing: ${_p}")
+        endif()
+        file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${_p}" _ph)
+        list(APPEND _patches "${CMAKE_CURRENT_SOURCE_DIR}/${_p}")
+        string(APPEND _stamp_parts "\n${_ph}")
+    endforeach()
+    string(SHA256 "${_stamp_parts}" _stamp_hash)
+    string(SUBSTRING "${_stamp_hash}" 0 12 _stamp_short)
+    string(SUBSTRING "${_commit}" 0 12 _commit_short)
+    string(REPLACE "/" "-" _mapped_name "${subdir}")
+    set(_mapped "${CMAKE_BINARY_DIR}/_deps/${_mapped_name}-${_commit_short}-${_stamp_short}")
+    set(_stamp "${_mapped}/.trellis-patch-stamp")
+    set(_current "")
+    if(EXISTS "${_stamp}")
+        file(READ "${_stamp}" _current)
     endif()
+    if(NOT _current STREQUAL _stamp_parts)
+        file(REMOVE_RECURSE "${_mapped}")
+        file(MAKE_DIRECTORY "${_mapped}")
+        set(_archive "${CMAKE_BINARY_DIR}/_deps/${_mapped_name}-${_commit_short}.tar")
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${_src}" archive --format=tar --output "${_archive}" HEAD
+            RESULT_VARIABLE _arch_res)
+        if(_arch_res EQUAL 0)
+            execute_process(
+                COMMAND "${CMAKE_COMMAND}" -E tar xf "${_archive}"
+                WORKING_DIRECTORY "${_mapped}"
+                RESULT_VARIABLE _extract_res)
+        endif()
+        file(REMOVE "${_archive}")
+        if(NOT _arch_res EQUAL 0)
+            message(FATAL_ERROR "Failed to materialize ${subdir} commit ${_commit}")
+        endif()
+        if(NOT _extract_res EQUAL 0)
+            message(FATAL_ERROR "Failed to extract ${subdir} archive")
+        endif()
+        foreach(_p IN LISTS _patches)
+            # The build tree sits inside the parent repository: prevent git from
+            # treating it as a path prefix and skipping patch entries outside it.
+            execute_process(
+                COMMAND "${CMAKE_COMMAND}" -E env
+                        "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}"
+                        "${GIT_EXECUTABLE}" apply "${_p}"
+                WORKING_DIRECTORY "${_mapped}"
+                RESULT_VARIABLE _apply_res
+                OUTPUT_VARIABLE _apply_out ERROR_VARIABLE _apply_out)
+            if(NOT _apply_res EQUAL 0)
+                message(FATAL_ERROR
+                    "Failed to apply ${_p} to ${subdir} ${_commit_short}.\n"
+                    "The submodule was updated and this integration patch is stale.\n"
+                    "  ${_apply_out}")
+            endif()
+        endforeach()
+        file(WRITE "${_stamp}" "${_stamp_parts}")
+        message(STATUS "Materialized ${subdir} ${_commit_short} (${_stamp_short})")
+    endif()
+    set(${out_var} "${_mapped}" PARENT_SCOPE)
+    set(${out_var}_COMMIT "${_commit}" PARENT_SCOPE)
 endfunction()
 
 if(TRELLIS2_USE_EXTERNAL_GGML)
     find_package(ggml CONFIG REQUIRED)
     set(TRELLIS2_GGML_TARGET ggml::ggml)
 else()
-    # Single shared ggml. Apply both the Q8_0 CUDA copy fix (needed by the
-    # trellis2 pipeline) and the RMBG custom-ops patch (deform-im2col, swin,
-    # ...). The RMBG submodule reuses this same ggml target when built here.
-    _trellis_apply_patch(third_party/ggml patches/ggml-cuda-cpy-q8_0.patch)
-    _trellis_apply_patch(third_party/ggml patches/ggml-rmbg-ops.patch)
-    add_subdirectory(third_party/ggml)
+    # Single shared ggml, materialized in the build tree with both the Q8_0
+    # CUDA copy fix (needed by the trellis2 pipeline) and the RMBG custom-ops
+    # patch (deform-im2col, swin, ...). The RMBG submodule reuses this same
+    # ggml target when built here.
+    # patches/ggml-rmbg-ops.patch is the canonical copy of the RMBG submodule's
+    # third_party/ggml-rmbg.patch; when the submodule updates it, sync it here
+    # automatically so this build follows upstream without manual steps.
+    set(_rmbg_upstream_patch "${CMAKE_CURRENT_SOURCE_DIR}/third_party/RMBG-2.0-GGML/third_party/ggml-rmbg.patch")
+    set(_rmbg_local_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-rmbg-ops.patch")
+    if(EXISTS "${_rmbg_upstream_patch}" AND EXISTS "${_rmbg_local_patch}")
+        file(SHA256 "${_rmbg_upstream_patch}" _up_sha)
+        file(SHA256 "${_rmbg_local_patch}" _loc_sha)
+        if(NOT _up_sha STREQUAL _loc_sha)
+            configure_file("${_rmbg_upstream_patch}" "${_rmbg_local_patch}" COPYONLY)
+            message(STATUS "Synced patches/ggml-rmbg-ops.patch from RMBG submodule")
+        endif()
+    endif()
+    _trellis_materialize_submodule(TRELLIS_GGML_MAPPED third_party/ggml
+        patches/ggml-cuda-cpy-q8_0.patch
+        patches/ggml-rmbg-ops.patch)
+    # The materialized tree has no .git: pass the real commit so ggml's
+    # configure skips its git rev-parse (which would otherwise find the
+    # parent repository) and reports the submodule commit correctly.
+    set(GGML_BUILD_COMMIT "${TRELLIS_GGML_MAPPED_COMMIT}")
+    add_subdirectory("${TRELLIS_GGML_MAPPED}")
     set(TRELLIS2_GGML_TARGET ggml)
 endif()
 
@@ -232,13 +307,15 @@ endif()
 # ─────────────────────────────────────────────────────────────────────────
 option(TRELLIS2_RMBG "Enable RMBG-2.0 AI background removal" ON)
 if(TRELLIS2_RMBG AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/RMBG-2.0-GGML/CMakeLists.txt")
-    # Make the RMBG submodule reuse this repo's single ggml target (and its
-    # stb headers) instead of pulling its own nested ggml, which would clash
-    # with the shared ggml target name.
-    _trellis_apply_patch(third_party/RMBG-2.0-GGML patches/rmbg-cmake-preprocess.patch)
+    # Materialize the RMBG submodule in the build tree (its working tree stays
+    # pristine) and apply the integration patch there: skip the nested ggml
+    # and use this repo's shared ggml + stb implementations.
+    _trellis_materialize_submodule(TRELLIS_RMBG_MAPPED third_party/RMBG-2.0-GGML
+        patches/rmbg-cmake-preprocess.patch)
     set(RMBG_BUILD_CLI        OFF CACHE BOOL "" FORCE)
     set(RMBG_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
-    add_subdirectory(third_party/RMBG-2.0-GGML EXCLUDE_FROM_ALL)
+    set(TRELLIS2_STB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/stb")
+    add_subdirectory("${TRELLIS_RMBG_MAPPED}" EXCLUDE_FROM_ALL)
     # RMBG reuses this repo's single ggml target (patched with Q8 + RMBG ops
     # above) and needs stb_image / stb_image_write implementations, which
     # trellis2 provides once via stb_impl.

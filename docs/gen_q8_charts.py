@@ -9,17 +9,17 @@ import os
 OUT = os.path.dirname(os.path.abspath(__file__))
 
 # ── Benchmark data ──────────────────────────────────────────────────────────
-# CUDA quality=512, steps=12
+# CUDA quality=512, steps=12 (ggml 0.18.1, clean environment)
 cuda_512 = {
-    "F16": {"time": 92.0, "verts": 1_867_007, "tris": 3_915_484},
-    "Q8":  {"time": 91.2, "verts": 1_807_953, "tris": 3_839_432},
+    "F16": {"time": 142.7, "verts": 1_884_862, "tris": 4_116_744},
+    "Q8":  {"time": 129.0, "verts": 1_824_032, "tris": 3_827_042},
 }
-# CUDA coarse, steps=12
+# CUDA coarse, steps=12 (ggml 0.18.1, clean environment)
 cuda_coarse = {
-    "F16": {"time": 42.7, "verts": 83_576, "tris": 167_236},
-    "Q8":  {"time": 43.0, "verts": 82_086, "tris": 164_264},
+    "F16": {"time": 46.9, "verts": 83_405, "tris": 166_864},
+    "Q8":  {"time": 44.4, "verts": 82_722, "tris": 165_520},
 }
-# CPU coarse, steps=12
+# CPU coarse, steps=12 (data from ggml 0.17 era, reused)
 cpu_coarse = {
     "F16": {"time": 780.8, "verts": 83_467, "tris": 166_982},
     # Q8 CPU still running; use CUDA ratio as estimate
@@ -71,7 +71,7 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 # Vertices
 labels = ["F16", "Q8"]
 verts_512 = [cuda_512["F16"]["verts"]/1e6, cuda_512["Q8"]["verts"]/1e6]
-verts_coarse = [cuda_coarse["F16"]["verts"]/1e3, cuda_coarse["Q8"]["verts"]/1e3]
+verts_coarse = [cuda_coarse["F16"]["verts"]/1e6, cuda_coarse["Q8"]["verts"]/1e6]
 
 x = np.arange(2)
 w = 0.35
@@ -87,14 +87,14 @@ for bar in bars1:
     axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.03,
                  f"{bar.get_height():.2f}M", ha="center", va="bottom", fontsize=10)
 for bar in bars2:
-    axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                 f"{bar.get_height():.0f}K", ha="center", va="bottom", fontsize=10)
+    axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.003,
+                 f"{bar.get_height()*1e3:.0f}K", ha="center", va="bottom", fontsize=10)
 axes[0].spines["top"].set_visible(False)
 axes[0].spines["right"].set_visible(False)
 
 # Triangles
 tris_512 = [cuda_512["F16"]["tris"]/1e6, cuda_512["Q8"]["tris"]/1e6]
-tris_coarse = [cuda_coarse["F16"]["tris"]/1e3, cuda_coarse["Q8"]["tris"]/1e3]
+tris_coarse = [cuda_coarse["F16"]["tris"]/1e6, cuda_coarse["Q8"]["tris"]/1e6]
 
 bars1 = axes[1].bar(x - w/2, tris_512, w, label="quality=512", color="#FF5722", edgecolor="white")
 bars2 = axes[1].bar(x + w/2, tris_coarse, w, label="coarse", color="#FF8A65", edgecolor="white")
@@ -108,8 +108,8 @@ for bar in bars1:
     axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
                  f"{bar.get_height():.2f}M", ha="center", va="bottom", fontsize=10)
 for bar in bars2:
-    axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 2,
-                 f"{bar.get_height():.0f}K", ha="center", va="bottom", fontsize=10)
+    axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.008,
+                 f"{bar.get_height()*1e3:.0f}K", ha="center", va="bottom", fontsize=10)
 axes[1].spines["top"].set_visible(False)
 axes[1].spines["right"].set_visible(False)
 
@@ -195,11 +195,11 @@ ax4.axis("off")
 
 table_data = [
     ["Metric", "F16 (CUDA)", "Q8 (CUDA)", "Δ (Q8 vs F16)"],
-    ["Time (512, 12 steps)", "92.0s", "91.2s", "−0.9% (faster)"],
-    ["Time (coarse, 12 steps)", "42.7s", "43.0s", "+0.7%"],
-    ["Vertices (512)", "1,867,007", "1,807,953", "−3.2%"],
-    ["Triangles (512)", "3,915,484", "3,839,432", "−1.9%"],
-    ["Vertices (coarse)", "83,576", "82,086", "−1.8%"],
+    ["Time (512, 12 steps)", "142.7s", "129.0s", "−9.6% (faster)"],
+    ["Time (coarse, 12 steps)", "46.9s", "44.4s", "−5.3%"],
+    ["Vertices (512)", "1,884,862", "1,824,032", "−3.2%"],
+    ["Triangles (512)", "4,116,744", "3,827,042", "−7.0%"],
+    ["Vertices (coarse)", "83,405", "82,722", "−0.8%"],
     ["Model weights size", "16.0 GB", "4.3 GB", "−73%"],
     ["12GB GPU feasible?", "No (OOM)", "Yes", "✓"],
 ]

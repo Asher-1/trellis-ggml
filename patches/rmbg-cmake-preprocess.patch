@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 664a99e..295cb82 100644
+index ea21db2..1579dfd 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -24,57 +24,63 @@ set(GGML_CUDA   ${RMBG_GGML_CUDA}   CACHE BOOL "" FORCE)
+@@ -24,109 +24,127 @@ set(GGML_CUDA   ${RMBG_GGML_CUDA}   CACHE BOOL "" FORCE)
  set(GGML_VULKAN ${RMBG_GGML_VULKAN} CACHE BOOL "" FORCE)
  set(GGML_METAL  ${RMBG_GGML_METAL}  CACHE BOOL "" FORCE)
  
@@ -16,104 +16,220 @@ index 664a99e..295cb82 100644
 +    # RMBG custom-ops patch to it. When built from trellis-ggml the host
 +    # already provides a patched ggml target (both Q8_0 copy and RMBG ops),
 +    # so we reuse it instead of pulling a second copy.
+ 
+-# ---------------------------------------------------------------------------
+-# Materialize the pinned ggml commit in the build tree and apply all RMBG
+-# changes there. This keeps the submodule immutable while making the patch a
+-# real configure input: editing it automatically rebuilds the patched tree.
+-# ---------------------------------------------------------------------------
+-set(GGML_PATCH "${RMBG_ROOT}/third_party/ggml-rmbg.patch")
+-if(NOT EXISTS "${GGML_PATCH}")
+-    message(FATAL_ERROR "Required ggml patch is missing: ${GGML_PATCH}")
+-endif()
+-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GGML_PATCH}")
+-find_package(Git REQUIRED)
+-execute_process(
+-    COMMAND "${GIT_EXECUTABLE}" -C "${RMBG_ROOT}/third_party/ggml" rev-parse HEAD
+-    OUTPUT_VARIABLE GGML_COMMIT
+-    OUTPUT_STRIP_TRAILING_WHITESPACE
+-    RESULT_VARIABLE GGML_REV_PARSE_RESULT
+-)
+-if(NOT GGML_REV_PARSE_RESULT EQUAL 0)
+-    message(FATAL_ERROR "Failed to read the pinned ggml submodule commit")
+-endif()
+-file(SHA256 "${GGML_PATCH}" GGML_PATCH_SHA256)
+-set(GGML_PATCH_PIPELINE_VERSION 5)
+-string(SUBSTRING "${GGML_COMMIT}" 0 12 GGML_COMMIT_SHORT)
+-string(SUBSTRING "${GGML_PATCH_SHA256}" 0 12 GGML_PATCH_SHORT)
+-set(GGML_PATCH_ID "${GGML_COMMIT_SHORT}-${GGML_PATCH_SHORT}")
+-set(GGML_PATCHED_SOURCE "${CMAKE_BINARY_DIR}/_deps/ggml-rmbg-src-${GGML_PATCH_ID}")
+-set(GGML_PATCHED_BINARY "${CMAKE_BINARY_DIR}/third_party/ggml-rmbg-${GGML_PATCH_ID}")
+-set(GGML_PATCH_STAMP "${GGML_PATCHED_SOURCE}/.rmbg-patch-stamp")
+-set(GGML_EXPECTED_STAMP
+-    "${GGML_PATCH_PIPELINE_VERSION}\n${GGML_COMMIT}\n${GGML_PATCH_SHA256}\n")
+-set(GGML_CURRENT_STAMP "")
+-if(EXISTS "${GGML_PATCH_STAMP}")
+-    file(READ "${GGML_PATCH_STAMP}" GGML_CURRENT_STAMP)
+-endif()
+-if(NOT GGML_CURRENT_STAMP STREQUAL GGML_EXPECTED_STAMP)
+-    file(REMOVE_RECURSE "${GGML_PATCHED_SOURCE}")
+-    file(MAKE_DIRECTORY "${GGML_PATCHED_SOURCE}")
+-    set(GGML_ARCHIVE "${CMAKE_BINARY_DIR}/_deps/ggml-${GGML_COMMIT}.tar")
+-    execute_process(
+-        COMMAND "${GIT_EXECUTABLE}" -C "${RMBG_ROOT}/third_party/ggml"
+-                archive --format=tar --output "${GGML_ARCHIVE}" HEAD
+-        RESULT_VARIABLE GGML_ARCHIVE_RESULT
+-    )
+-    if(GGML_ARCHIVE_RESULT EQUAL 0)
+-        execute_process(
+-            COMMAND "${CMAKE_COMMAND}" -E tar xf "${GGML_ARCHIVE}"
+-            WORKING_DIRECTORY "${GGML_PATCHED_SOURCE}"
+-            RESULT_VARIABLE GGML_EXTRACT_RESULT
+-        )
+-    endif()
+-    file(REMOVE "${GGML_ARCHIVE}")
+-    if(NOT GGML_ARCHIVE_RESULT EQUAL 0)
+-        message(FATAL_ERROR "Failed to materialize ggml commit ${GGML_COMMIT}")
 +    if(NOT EXISTS "${RMBG_ROOT}/third_party/ggml/CMakeLists.txt")
 +        message(FATAL_ERROR
 +            "ggml submodule missing. Run:\n"
 +            "  git submodule update --init --recursive third_party/ggml")
-+    endif()
- 
--# ---------------------------------------------------------------------------
--# Apply RMBG-specific ggml patches automatically.
--# The ggml submodule is kept pristine (tracked only by its pinned commit);
--# all RMBG custom ops (deform-im2col, swin qkv/windows, ...) live in
--# third_party/ggml-rmbg.patch and are applied here so that any machine
--# building this repo gets identical sources.
--# ---------------------------------------------------------------------------
--set(GGML_PATCH "${RMBG_ROOT}/third_party/ggml-rmbg.patch")
--if(EXISTS "${GGML_PATCH}")
--    execute_process(
--        COMMAND ${CMAKE_COMMAND} -E env git apply --check "${GGML_PATCH}"
--        WORKING_DIRECTORY "${RMBG_ROOT}/third_party/ggml"
--        RESULT_VARIABLE GGML_PATCH_FWD
--        ERROR_QUIET
--    )
--    if(GGML_PATCH_FWD EQUAL 0)
--        # Not yet applied -> apply it.
-+    # Apply RMBG-specific ggml patches automatically.
-+    # The ggml submodule is kept pristine (tracked only by its pinned commit);
-+    # all RMBG custom ops (deform-im2col, swin qkv/windows, ...) live in
-+    # third_party/ggml-rmbg.patch.
-+    set(GGML_PATCH "${RMBG_ROOT}/third_party/ggml-rmbg.patch")
-+    if(EXISTS "${GGML_PATCH}")
-         execute_process(
--            COMMAND ${CMAKE_COMMAND} -E env git apply "${GGML_PATCH}"
-+            COMMAND ${CMAKE_COMMAND} -E env git apply --check "${GGML_PATCH}"
-             WORKING_DIRECTORY "${RMBG_ROOT}/third_party/ggml"
--            RESULT_VARIABLE GGML_PATCH_APPLY
--        )
--        if(NOT GGML_PATCH_APPLY EQUAL 0)
--            message(FATAL_ERROR "Failed to apply ggml patch: ${GGML_PATCH}")
--        endif()
--        message(STATUS "Applied ggml patch: ${GGML_PATCH}")
--    else()
--        # Forward apply failed -> check whether it is already applied.
--        execute_process(
--            COMMAND ${CMAKE_COMMAND} -E env git apply --check --reverse "${GGML_PATCH}"
--            WORKING_DIRECTORY "${RMBG_ROOT}/third_party/ggml"
--            RESULT_VARIABLE GGML_PATCH_REV
-+            RESULT_VARIABLE GGML_PATCH_FWD
-             ERROR_QUIET
-         )
--        if(GGML_PATCH_REV EQUAL 0)
--            message(STATUS "ggml patch already applied: ${GGML_PATCH}")
-+        if(GGML_PATCH_FWD EQUAL 0)
-+            execute_process(
-+                COMMAND ${CMAKE_COMMAND} -E env git apply "${GGML_PATCH}"
-+                WORKING_DIRECTORY "${RMBG_ROOT}/third_party/ggml"
-+                RESULT_VARIABLE GGML_PATCH_APPLY
-+            )
-+            if(NOT GGML_PATCH_APPLY EQUAL 0)
-+                message(FATAL_ERROR "Failed to apply ggml patch: ${GGML_PATCH}")
-+            endif()
-+            message(STATUS "Applied ggml patch: ${GGML_PATCH}")
-         else()
--            message(FATAL_ERROR
--                "ggml source tree is neither clean nor patched. "
--                "Reset it to the pinned commit first:\n"
--                "  cd third_party/ggml && git checkout -- . && git clean -fd")
-+            execute_process(
-+                COMMAND ${CMAKE_COMMAND} -E env git apply --check --reverse "${GGML_PATCH}"
-+                WORKING_DIRECTORY "${RMBG_ROOT}/third_party/ggml"
-+                RESULT_VARIABLE GGML_PATCH_REV
-+                ERROR_QUIET
-+            )
-+            if(GGML_PATCH_REV EQUAL 0)
-+                message(STATUS "ggml patch already applied: ${GGML_PATCH}")
-+            else()
-+                message(FATAL_ERROR
-+                    "ggml source tree is neither clean nor patched. "
-+                    "Reset it to the pinned commit first:\n"
-+                    "  cd third_party/ggml && git checkout -- . && git clean -fd")
-+            endif()
-         endif()
      endif()
-+    add_subdirectory(third_party/ggml EXCLUDE_FROM_ALL)
-+    set(_RMBG_GGML_EXAMPLES_DIR "${RMBG_ROOT}/third_party/ggml/examples")
+-    if(NOT GGML_EXTRACT_RESULT EQUAL 0)
+-        message(FATAL_ERROR "Failed to extract ggml commit ${GGML_COMMIT}")
++
++    # ---------------------------------------------------------------------------
++    # Materialize the pinned ggml commit in the build tree and apply all RMBG
++    # changes there. This keeps the submodule immutable while making the patch a
++    # real configure input: editing it automatically rebuilds the patched tree.
++    # ---------------------------------------------------------------------------
++    set(GGML_PATCH "${RMBG_ROOT}/third_party/ggml-rmbg.patch")
++    if(NOT EXISTS "${GGML_PATCH}")
++        message(FATAL_ERROR "Required ggml patch is missing: ${GGML_PATCH}")
+     endif()
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GGML_PATCH}")
++    find_package(Git REQUIRED)
+     execute_process(
+-        # The build tree is inside the parent repository. Prevent git from
+-        # treating this directory as a path prefix and silently skipping every
+-        # patch entry that lies outside that prefix.
+-        COMMAND "${CMAKE_COMMAND}" -E env
+-                "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}"
+-                "${GIT_EXECUTABLE}" apply --check "${GGML_PATCH}"
+-        WORKING_DIRECTORY "${GGML_PATCHED_SOURCE}"
+-        RESULT_VARIABLE GGML_PATCH_CHECK_RESULT
++        COMMAND "${GIT_EXECUTABLE}" -C "${RMBG_ROOT}/third_party/ggml" rev-parse HEAD
++        OUTPUT_VARIABLE GGML_COMMIT
++        OUTPUT_STRIP_TRAILING_WHITESPACE
++        RESULT_VARIABLE GGML_REV_PARSE_RESULT
+     )
+-    if(NOT GGML_PATCH_CHECK_RESULT EQUAL 0)
+-        message(FATAL_ERROR
+-            "ggml patch does not apply to pinned commit ${GGML_COMMIT}: ${GGML_PATCH}")
++    if(NOT GGML_REV_PARSE_RESULT EQUAL 0)
++        message(FATAL_ERROR "Failed to read the pinned ggml submodule commit")
+     endif()
+-    execute_process(
+-        COMMAND "${CMAKE_COMMAND}" -E env
+-                "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}"
+-                "${GIT_EXECUTABLE}" apply "${GGML_PATCH}"
+-        WORKING_DIRECTORY "${GGML_PATCHED_SOURCE}"
+-        RESULT_VARIABLE GGML_PATCH_APPLY_RESULT
+-    )
+-    if(NOT GGML_PATCH_APPLY_RESULT EQUAL 0)
+-        message(FATAL_ERROR "Failed to apply ggml patch: ${GGML_PATCH}")
++    file(SHA256 "${GGML_PATCH}" GGML_PATCH_SHA256)
++    set(GGML_PATCH_PIPELINE_VERSION 5)
++    string(SUBSTRING "${GGML_COMMIT}" 0 12 GGML_COMMIT_SHORT)
++    string(SUBSTRING "${GGML_PATCH_SHA256}" 0 12 GGML_PATCH_SHORT)
++    set(GGML_PATCH_ID "${GGML_COMMIT_SHORT}-${GGML_PATCH_SHORT}")
++    set(GGML_PATCHED_SOURCE "${CMAKE_BINARY_DIR}/_deps/ggml-rmbg-src-${GGML_PATCH_ID}")
++    set(GGML_PATCHED_BINARY "${CMAKE_BINARY_DIR}/third_party/ggml-rmbg-${GGML_PATCH_ID}")
++    set(GGML_PATCH_STAMP "${GGML_PATCHED_SOURCE}/.rmbg-patch-stamp")
++    set(GGML_EXPECTED_STAMP
++        "${GGML_PATCH_PIPELINE_VERSION}\n${GGML_COMMIT}\n${GGML_PATCH_SHA256}\n")
++    set(GGML_CURRENT_STAMP "")
++    if(EXISTS "${GGML_PATCH_STAMP}")
++        file(READ "${GGML_PATCH_STAMP}" GGML_CURRENT_STAMP)
+     endif()
+-    execute_process(
+-        COMMAND "${CMAKE_COMMAND}" -E env
+-                "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}"
+-                "${GIT_EXECUTABLE}" apply --check --reverse "${GGML_PATCH}"
+-        WORKING_DIRECTORY "${GGML_PATCHED_SOURCE}"
+-        RESULT_VARIABLE GGML_PATCH_VERIFY_RESULT
+-    )
+-    if(NOT GGML_PATCH_VERIFY_RESULT EQUAL 0 OR
+-       NOT EXISTS "${GGML_PATCHED_SOURCE}/src/ggml-cuda/rmbg-deform-im2col.cu")
+-        message(FATAL_ERROR "ggml patch post-apply verification failed: ${GGML_PATCH}")
++    if(NOT GGML_CURRENT_STAMP STREQUAL GGML_EXPECTED_STAMP)
++        file(REMOVE_RECURSE "${GGML_PATCHED_SOURCE}")
++        file(MAKE_DIRECTORY "${GGML_PATCHED_SOURCE}")
++        set(GGML_ARCHIVE "${CMAKE_BINARY_DIR}/_deps/ggml-${GGML_COMMIT}.tar")
++        execute_process(
++            COMMAND "${GIT_EXECUTABLE}" -C "${RMBG_ROOT}/third_party/ggml"
++                    archive --format=tar --output "${GGML_ARCHIVE}" HEAD
++            RESULT_VARIABLE GGML_ARCHIVE_RESULT
++        )
++        if(GGML_ARCHIVE_RESULT EQUAL 0)
++            execute_process(
++                COMMAND "${CMAKE_COMMAND}" -E tar xf "${GGML_ARCHIVE}"
++                WORKING_DIRECTORY "${GGML_PATCHED_SOURCE}"
++                RESULT_VARIABLE GGML_EXTRACT_RESULT
++            )
++        endif()
++        file(REMOVE "${GGML_ARCHIVE}")
++        if(NOT GGML_ARCHIVE_RESULT EQUAL 0)
++            message(FATAL_ERROR "Failed to materialize ggml commit ${GGML_COMMIT}")
++        endif()
++        if(NOT GGML_EXTRACT_RESULT EQUAL 0)
++            message(FATAL_ERROR "Failed to extract ggml commit ${GGML_COMMIT}")
++        endif()
++        execute_process(
++            # The build tree is inside the parent repository. Prevent git from
++            # treating this directory as a path prefix and silently skipping every
++            # patch entry that lies outside that prefix.
++            COMMAND "${CMAKE_COMMAND}" -E env
++                    "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}"
++                    "${GIT_EXECUTABLE}" apply --check "${GGML_PATCH}"
++            WORKING_DIRECTORY "${GGML_PATCHED_SOURCE}"
++            RESULT_VARIABLE GGML_PATCH_CHECK_RESULT
++        )
++        if(NOT GGML_PATCH_CHECK_RESULT EQUAL 0)
++            message(FATAL_ERROR
++                "ggml patch does not apply to pinned commit ${GGML_COMMIT}: ${GGML_PATCH}")
++        endif()
++        execute_process(
++            COMMAND "${CMAKE_COMMAND}" -E env
++                    "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}"
++                    "${GIT_EXECUTABLE}" apply "${GGML_PATCH}"
++            WORKING_DIRECTORY "${GGML_PATCHED_SOURCE}"
++            RESULT_VARIABLE GGML_PATCH_APPLY_RESULT
++        )
++        if(NOT GGML_PATCH_APPLY_RESULT EQUAL 0)
++            message(FATAL_ERROR "Failed to apply ggml patch: ${GGML_PATCH}")
++        endif()
++        execute_process(
++            COMMAND "${CMAKE_COMMAND}" -E env
++                    "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}"
++                    "${GIT_EXECUTABLE}" apply --check --reverse "${GGML_PATCH}"
++            WORKING_DIRECTORY "${GGML_PATCHED_SOURCE}"
++            RESULT_VARIABLE GGML_PATCH_VERIFY_RESULT
++        )
++        if(NOT GGML_PATCH_VERIFY_RESULT EQUAL 0 OR
++           NOT EXISTS "${GGML_PATCHED_SOURCE}/src/ggml-cuda/rmbg-deform-im2col.cu")
++            message(FATAL_ERROR "ggml patch post-apply verification failed: ${GGML_PATCH}")
++        endif()
++        file(WRITE "${GGML_PATCH_STAMP}" "${GGML_EXPECTED_STAMP}")
++        message(STATUS "Materialized ggml ${GGML_COMMIT} with patch ${GGML_PATCH_SHA256}")
++    endif()
++    set(GGML_BUILD_COMMIT "${GGML_COMMIT_SHORT}+rmbg.${GGML_PATCH_SHORT}")
++    add_subdirectory("${GGML_PATCHED_SOURCE}" "${GGML_PATCHED_BINARY}" EXCLUDE_FROM_ALL)
++    set(GGML_BUILD_COMMIT "${GGML_COMMIT_SHORT}+rmbg.${GGML_PATCH_SHORT}")
++    set(_RMBG_GGML_EXAMPLES_DIR "${GGML_PATCHED_SOURCE}/examples")
 +else()
 +    # Reusing the host's ggml target. stb headers come from the host's
-+    # centralized stb/ dir so declarations match the stb_impl implementations.
-+    set(_RMBG_GGML_EXAMPLES_DIR "${RMBG_ROOT}/../../stb")
++    # centralized stb/ dir (TRELLIS2_STB_DIR, set by trellis-ggml before
++    # add_subdirectory) so declarations match the stb_impl implementations.
++    if(NOT TRELLIS2_STB_DIR)
++        message(FATAL_ERROR "TRELLIS2_STB_DIR is required when reusing a host ggml target")
+     endif()
+-    file(WRITE "${GGML_PATCH_STAMP}" "${GGML_EXPECTED_STAMP}")
+-    message(STATUS "Materialized ggml ${GGML_COMMIT} with patch ${GGML_PATCH_SHA256}")
++    set(_RMBG_GGML_EXAMPLES_DIR "${TRELLIS2_STB_DIR}")
  endif()
--add_subdirectory(third_party/ggml EXCLUDE_FROM_ALL)
+-set(GGML_BUILD_COMMIT "${GGML_COMMIT_SHORT}+rmbg.${GGML_PATCH_SHORT}")
+-add_subdirectory("${GGML_PATCHED_SOURCE}" "${GGML_PATCHED_BINARY}" EXCLUDE_FROM_ALL)
++
  
  set(RMBG_SOURCES
      src/backend.cpp
-@@ -94,7 +100,7 @@ if(RMBG_SHARED)
+@@ -146,7 +164,7 @@ if(RMBG_SHARED)
  else()
      add_library(rmbg STATIC ${RMBG_SOURCES})
  endif()
--target_include_directories(rmbg PUBLIC include PRIVATE third_party/ggml/examples)
-+target_include_directories(rmbg PUBLIC include PRIVATE ${_RMBG_GGML_EXAMPLES_DIR})
+-target_include_directories(rmbg PUBLIC include PRIVATE "${GGML_PATCHED_SOURCE}/examples")
++target_include_directories(rmbg PUBLIC include PRIVATE "${_RMBG_GGML_EXAMPLES_DIR}")
  target_link_libraries(rmbg PUBLIC ggml)
  
  if(RMBG_BUILD_CLI)
