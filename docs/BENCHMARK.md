@@ -1,6 +1,6 @@
 # TRELLIS.2-4B Benchmark: ggml vs PyTorch CUDA
 
-> 各模型的角色、架构、参数量与精度说明见 [MODELS.md](MODELS.md)。
+> 各模型的角色、架构、参数量与精度说明见 [models/MODEL_CARD.md](../models/MODEL_CARD.md)。
 
 ## 硬件环境
 - **GPU**: NVIDIA GeForce RTX 3060 (12GB VRAM)

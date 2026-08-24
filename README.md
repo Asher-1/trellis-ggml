@@ -241,7 +241,7 @@ Full benchmark data, charts, and analysis are available in
 [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
 
 Per-model reference (architecture, params, role in the pipeline, per-stage
-latency, precision notes) is in [`docs/MODELS.md`](docs/MODELS.md).
+latency, precision notes) is in [`models/MODEL_CARD.md`](models/MODEL_CARD.md).
 
 ## Components
 

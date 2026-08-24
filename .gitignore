@@ -54,7 +54,8 @@ __pycache__/
 *.pyc
 
 # model / reference artifacts
-/models/
+/models/*
+!/models/MODEL_CARD.md
 /ggufs/
 /dumps/
 /generations/
