@@ -18,7 +18,7 @@ approach that keeps submodule working trees pristine.
 
 | Patch | Applies to | Purpose |
 |-------|-----------|---------|
-| `patches/ggml-cuda-cpy-q8_0.patch` | `third_party/ggml` | Add `ggml_cpy` for Q8_0 → Q8_0 on CUDA (needed by the trellis2 pipeline; upstream CUDA backend lacks it). |
+| `patches/ggml-trellis.patch` | `third_party/ggml` | Merged trellis-ggml fixes: (1) `ggml_cpy` for Q8_0 → Q8_0 on CUDA (upstream CUDA backend lacks it — formerly a separate `ggml-cuda-cpy-q8_0.patch`, merged here); (2) keep contiguous F32×F32, F32×F16 and F16×F32 GEMMs at full FP32 precision on Vulkan — coopmat2 only ships fp16 shaders, so ggml-vulkan would otherwise silently round F32 operands to fp16 (~5e-2 error on DINOv3 `embd`, and a nullptr crash for F16×F32). The F32/F16×F32 pipelines are wired to the base `matmul_*_fp32` shaders (pure FP32 accumulate) with base-layout warptile spec constants; the Q8_1 `quantize_y` path is skipped for F32 src0 (it crashes on coopmat2 devices). fp16/bf16 weights still use coopmat2, so f16/q8 deployment is unaffected. |
 | `patches/ggml-rmbg-ops.patch` | `third_party/ggml` | RMBG custom operators (deform-im2col, swin qkv/windows, ...) — **auto-synced** from RMBG upstream's `third_party/ggml-rmbg.patch` at configure time. |
 | `patches/rmbg-cmake-preprocess.patch` | `third_party/RMBG-2.0-GGML` | Make the RMBG submodule reuse the host's shared `ggml` target (instead of `add_subdirectory`-ing its own, which would collide) and take stb headers from the host's centralized `stb/`. |
 
@@ -94,7 +94,7 @@ The fix:
    patch) rather than accepting a nested copy.
 
 4. **Keep the two ggml patches non-overlapping.** If a future ggml bump causes
-   `ggml-rmbg-ops.patch` and `ggml-cuda-cpy-q8_0.patch` to touch the same file,
+   `ggml-rmbg-ops.patch` and `ggml-trellis.patch` to touch the same file,
    reconcile them into one combined patch.
 
 5. **The `ggml-rmbg-ops.patch` is auto-synced.** Do not edit

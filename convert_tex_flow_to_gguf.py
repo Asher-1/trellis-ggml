@@ -21,7 +21,7 @@ Usage:
     python convert_tex_flow_to_gguf.py \
         --model models/TRELLIS.2-4B/ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors \
         --texturing-json models/TRELLIS.2-4B/texturing_pipeline.json \
-        --output ggufs/tex_slat_flow_512_f16.gguf --ftype 1
+        --output models/tex_slat_flow_512_f16.gguf --ftype 1
 """
 
 import argparse

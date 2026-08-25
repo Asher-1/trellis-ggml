@@ -78,7 +78,7 @@ endif()
 # a fresh checkout still gets a green (skipped) suite.
 set(T2_GGUFS "$ENV{TRELLIS2_GGUF_DIR}")
 if(NOT T2_GGUFS)
-    set(T2_GGUFS "${CMAKE_CURRENT_SOURCE_DIR}/../ggufs")
+    set(T2_GGUFS "${CMAKE_CURRENT_SOURCE_DIR}/../models")
 endif()
 set(T2_DUMPS "$ENV{TRELLIS2_DUMPS}")
 if(NOT T2_DUMPS)

@@ -23,7 +23,7 @@ docker run --rm -v "$ROOT":/work -w /work -e GOCACHE=/tmp/gocache trellis2-demo 
   cd server && CGO_ENABLED=0 go build -o trellis2-server-linux .'
 
 # Fetch prebuilt f16 GGUFs from the public LocalAI-io repos. Files already present
-# are skipped, so this is a no-op once ggufs/ is populated; it lets fresh demo
+# are skipped, so this is a no-op once models/ is populated; it lets fresh demo
 # users skip the separate download_models.sh + convert_all.sh steps.
 scripts/download_ggufs.sh
 
@@ -31,4 +31,4 @@ docker rm -f trellis2-demo-run 2>/dev/null || true
 exec docker run --rm --name trellis2-demo-run --device nvidia.com/gpu=all \
     -v "$ROOT":/work -w /work/server -p "$PORT":8742 trellis2-demo \
     ./trellis2-server-linux -lib /work/build-cuda-shared/libtrellis2.so \
-    -ggufs /work/ggufs -store /work/generations -unload-idle -addr :8742 "$@"
+    -ggufs /work/models -store /work/generations -unload-idle -addr :8742 "$@"

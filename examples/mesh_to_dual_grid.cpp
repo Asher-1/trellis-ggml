@@ -1,4 +1,5 @@
 #include "mesh_to_dual_grid.h"
+#include <cstddef>
 
 #include "../third_party/o-voxel-fdg/fdg_api.h"
 

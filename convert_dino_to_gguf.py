@@ -19,7 +19,7 @@ their HF state-dict names; hyperparameters travel as `trellis2.dino.*` KV.
 
 Usage:
     python convert_dino_to_gguf.py --model models/dinov3-vitl16/model.safetensors \
-        --output ggufs/dino_f32.gguf --ftype 0
+        --output models/dino_f32.gguf --ftype 0
 
 ftype: 0 = f32 (validation), 1 = f16 (matrices f16; norms/biases/1-D f32).
 """

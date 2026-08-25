@@ -39,8 +39,30 @@ int main() {
                      out.verts.size()/3, out.tris.size()/3, out.normals.size()/3);
         return 1;
     }
-    if (!out.pbr.empty()) {
-        std::fprintf(stderr, "new Alpha Wrap vertices incorrectly retained source PBR\n");
+    // Alpha Wrap creates new offset vertices, so a textured source reaches the
+    // caller only as the closest-surface projected per-vertex preview (6 floats
+    // per vertex) that the server previews with; the sharp per-texel transfer
+    // stays in the GLB bake. Retaining source attributes verbatim is a bug.
+    if (out.pbr.size() != out.verts.size() * 2) {
+        std::fprintf(stderr, "textured wrap lost its projected per-vertex PBR preview\n");
+        return 1;
+    }
+    for (const float v : out.pbr) {
+        if (!std::isfinite(v)) {
+            std::fprintf(stderr, "projected PBR preview contains a non-finite value\n");
+            return 1;
+        }
+    }
+
+    // The same wrap without a source material must stay geometry-only.
+    t2glb::PreparedMesh bare;
+    if (!t2glb::prepare_print_mesh(verts, 3, tris, 1, nullptr, opt,
+                                   0.20f, 0.03f, bare, err)) {
+        std::fprintf(stderr, "untextured prepare_print_mesh failed: %s\n", err.c_str());
+        return 1;
+    }
+    if (!bare.pbr.empty()) {
+        std::fprintf(stderr, "untextured wrap unexpectedly grew PBR\n");
         return 1;
     }
 

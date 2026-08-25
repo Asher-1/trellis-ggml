@@ -2,7 +2,7 @@
 //
 //	cmake -B build-shared -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build-shared -j
 //	cd server && CGO_ENABLED=0 go build -o trellis2-server .
-//	./trellis2-server -lib ../build-shared/libtrellis2.so -ggufs ../ggufs
+//	./trellis2-server -lib ../build-shared/libtrellis2.so -ggufs ../models
 //
 // API:
 //
@@ -1007,21 +1007,21 @@ func formFloat(r *http.Request, key string, def float32) float32 {
 
 func main() {
 	libPath := flag.String("lib", "../build-shared/libtrellis2.so", "path to libtrellis2.so")
-	ggufDir := flag.String("ggufs", "../ggufs", "directory with the model ggufs")
-	dino := flag.String("dino", "", "dino gguf (default <ggufs>/dino_f16.gguf)")
-	flow := flag.String("flow", "", "ss_flow gguf (default <ggufs>/ss_flow_f16.gguf)")
-	dec := flag.String("dec", "", "ss_dec gguf (default <ggufs>/ss_dec_f16.gguf)")
-	slat := flag.String("slat", "", "512 shape-slat flow gguf (default <ggufs>/slat_flow_f16.gguf)")
-	slatHR := flag.String("slat-hr", "", "1024 shape-slat flow gguf (default <ggufs>/slat_flow_1024_f16.gguf)")
-	shapeDec := flag.String("shape-dec", "", "shape decoder gguf (default <ggufs>/shape_dec_f16.gguf)")
-	shapeEnc := flag.String("shape-enc", "", "shape encoder gguf (default <ggufs>/shape_enc_f16.gguf)")
-	texDec := flag.String("tex-dec", "", "texture decoder gguf (default <ggufs>/tex_dec_f16.gguf)")
-	texSlat := flag.String("tex-slat", "", "512 texture-slat flow gguf (default <ggufs>/tex_slat_flow_512_f16.gguf)")
-	texSlatHR := flag.String("tex-slat-hr", "", "1024 texture-slat flow gguf (default <ggufs>/tex_slat_flow_1024_f16.gguf)")
+	ggufDir := flag.String("ggufs", "../models", "directory with the model ggufs")
+	dino := flag.String("dino", "", "dino gguf (default <models>/dino_f16.gguf)")
+	flow := flag.String("flow", "", "ss_flow gguf (default <models>/ss_flow_f16.gguf)")
+	dec := flag.String("dec", "", "ss_dec gguf (default <models>/ss_dec_f16.gguf)")
+	slat := flag.String("slat", "", "512 shape-slat flow gguf (default <models>/slat_flow_f16.gguf)")
+	slatHR := flag.String("slat-hr", "", "1024 shape-slat flow gguf (default <models>/slat_flow_1024_f16.gguf)")
+	shapeDec := flag.String("shape-dec", "", "shape decoder gguf (default <models>/shape_dec_f16.gguf)")
+	shapeEnc := flag.String("shape-enc", "", "shape encoder gguf (default <models>/shape_enc_f16.gguf)")
+	texDec := flag.String("tex-dec", "", "texture decoder gguf (default <models>/tex_dec_f16.gguf)")
+	texSlat := flag.String("tex-slat", "", "512 texture-slat flow gguf (default <models>/tex_slat_flow_512_f16.gguf)")
+	texSlatHR := flag.String("tex-slat-hr", "", "1024 texture-slat flow gguf (default <models>/tex_slat_flow_1024_f16.gguf)")
 	coarse := flag.Bool("coarse", false, "coarse marching-cubes path only (skip shape-SLAT models)")
 	no1024 := flag.Bool("no-1024", false, "disable the 1024 cascade (512 fine max)")
 	noTexture := flag.Bool("no-texture", false, "disable PBR texturing (geometry only)")
-	rmbgModel := flag.String("rmbg-model", "", "RMBG-2.0 GGUF for AI background removal (default: auto-detect <ggufs>/rmbg_f16.gguf)")
+	rmbgModel := flag.String("rmbg-model", "", "RMBG-2.0 GGUF for AI background removal (default: auto-detect <models>/rmbg_f16.gguf)")
 	addr := flag.String("addr", ":8742", "listen address")
 	storeDir := flag.String("store", "../generations", "durable completed-generation directory (empty disables persistence)")
 	unloadIdle := flag.Bool("unload-idle", false, "start with models unloaded and release them after each idle generation")

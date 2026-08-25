@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GGUFS="${GGUFS:-$ROOT/ggufs}"
+GGUFS="${GGUFS:-$ROOT/models}"
 CARDS="$ROOT/scripts/hf"
 ORG="${GGUF_ORG:-LocalAI-io}"
 

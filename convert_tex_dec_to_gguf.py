@@ -18,7 +18,7 @@ Same architecture/weight layout as the shape decoder otherwise:
     SparseConvNeXtBlock3d blocks, SparseResBlockC2S3d up-blocks.
 Conv weights are FlexGEMM [Co,kD,kH,kW,Ci] -> reshaped to [Co, kD*kH*kW, Ci].
 
-Usage: python convert_tex_dec_to_gguf.py --output ggufs/tex_dec_f16.gguf --ftype 1
+Usage: python convert_tex_dec_to_gguf.py --output models/tex_dec_f16.gguf --ftype 1
 """
 
 import argparse

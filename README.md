@@ -1,11 +1,12 @@
 # trellis2.cpp
 
 A C++/[ggml](https://github.com/ggml-org/ggml) implementation of the
-**TRELLIS.2** image-to-3D pipeline: an image goes in, a 3D mesh with per-vertex
-PBR textures comes out, with all inference in C++/ggml (no PyTorch at runtime).
-The demo can also export the result into a portable, full-density **GLB** with
-standard interpolated vertex colour and retained PBR attributes—no reference
-container required.
+**TRELLIS.2** image-to-3D pipeline: an image goes in, a 3D mesh with PBR
+textures comes out, with all inference in C++/ggml (no PyTorch at runtime).
+The demo can also export the result into a portable **GLB** with baked
+`baseColorTexture` / `metallicRoughnessTexture` UV atlas, `alphaMode: BLEND`
+and `doubleSided` — no reference container required (see
+docs/UV_GLB.md).
 
 Modeled structurally after [sam3.cpp](https://github.com/rms80/sam3.cpp):
 single-file library (`trellis2.h` / `trellis2.cpp`), bundled ggml as a
@@ -15,22 +16,19 @@ a Go demo server with a browser mesh viewer.
 
 ## Quick start
 
-### Local inference with Q8 (recommended, fits 12GB GPU)
+### Local inference (default chain: F16, see `.AGENTS.md`)
 
 ```sh
 git submodule update --init --depth 1                 # ggml + RMBG-2.0-GGML
 # NOTE: required submodule fixes (ggml Q8_0 CUDA copy + RMBG custom ops) are
 # applied automatically by CMake at configure time. No manual step needed.
-scripts/download_ggufs.sh                             # prebuilt f16 GGUFs -> ggufs/ (~14 GB)
-
-# Quantize to Q8 (precision-sensitive decoders stay F16)
-python3 quantize_to_q8.py --batch ggufs/ models/ --skip shape_dec --skip tex_dec --skip shape_enc
+scripts/download_ggufs.sh                             # prebuilt f16 GGUFs -> models/ (~14 GB)
 
 # Build with CUDA
 cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build-cuda -j6
 
-# Run (Q8 models, ~4.3 GB total, default --quantization q8)
+# Run (default --quantization f16; q8 is optional and only quantizes ss_dec)
 ./build-cuda/examples/t2_generate \
   --input image.png \
   --out-mesh output.t2mesh --out-glb output.glb \
@@ -42,7 +40,7 @@ cmake --build build-cuda -j6
 ```sh
 git submodule update --init --depth 1                 # ggml + RMBG-2.0-GGML
 # NOTE: required submodule fixes are applied automatically by CMake.
-scripts/download_ggufs.sh                             # prebuilt f16 GGUFs -> ggufs/ (~14 GB)
+scripts/download_ggufs.sh                             # prebuilt f16 GGUFs -> models/ (~14 GB)
 docker build -f docker/Dockerfile.demo -t trellis2-demo docker   # CUDA runtime + Go
 # build the CUDA shared lib + Go server, then run
 docker run --rm -v "$PWD":/work -w /work trellis2-demo bash -c '
@@ -51,7 +49,7 @@ docker run --rm -v "$PWD":/work -w /work trellis2-demo bash -c '
   cd server && go build -o trellis2-server-linux .'
 docker run --rm --device nvidia.com/gpu=all -v "$PWD":/work -w /work/server -p 8742:8742 \
   trellis2-demo ./trellis2-server-linux -lib /work/build-cuda-shared/libtrellis2.so \
-  -ggufs /work/ggufs -store /work/generations -unload-idle
+  -ggufs /work/models -store /work/generations -unload-idle
 # open http://localhost:8742 and drop an image
 ```
 
@@ -72,7 +70,7 @@ safetensors download and the conversion step entirely:
 > every 1.3B `*_f16.gguf` is ~2.4 GB), which GitHub Releases caps at 2 GiB per
 > file and plain git warns at 100 MB. HuggingFace has no such per-file limit and
 > is the standard channel for model weights, so the weights are hosted there and
-> fetched at runtime (`models/` and `ggufs/` are git-ignored). The GitHub repo
+> fetched at runtime (`models/` is git-ignored). The GitHub repo
 > stays lean and always points at the latest published HF artifacts.
 
 **Developers** who need the f32 validation variants, or who want to regenerate the
@@ -103,10 +101,12 @@ Completed jobs expose `durationMs`, `livePreview`, and per-stage `stageTimings`
 through `/api/job/{id}` and persist those diagnostics in their manifest.
 The always-visible **asset export** panel preserves the generated polygon count,
 can preview component cleanup, optionally keep only the largest connected piece,
-restore the original preview, and download a Three.js-ready GLB. Dense generated
-materials are stored as standard interpolated vertex colours rather than a
-sub-texel per-triangle atlas; original metallic/roughness values are also retained
-in the custom `_METALLIC_ROUGHNESS` attribute. All components are preserved by
+restore the original preview, and download a Three.js-ready GLB. The default
+export decimates the dense mesh (`T2GLB_DECIMATION`, default 500k tris),
+UV-unwraps it, and bakes PBR into a `baseColorTexture` (RGBA, alpha preserved)
+plus `metallicRoughnessTexture` atlas — the same structure upstream emits.
+`T2GLB_VERTEX=1` opts back into the legacy full-density per-vertex colour GLB.
+All components are preserved by
 default; destructive cleanup must be selected explicitly. Showcase mode likewise loads the original
 full-density mesh. Open `/showcase` for the separate full-screen storyboard: it
 starts each generation with its saved source image centered, moves that image to
@@ -267,7 +267,7 @@ latency, precision notes) is in [`models/MODEL_CARD.md`](models/MODEL_CARD.md).
   from an external `dump_dinodata.py`. `dino_encode` chains them:
 
   ```sh
-  ./build/examples/dino_encode ggufs/dino_f16.gguf image.png cond.dinodata
+  ./build/examples/dino_encode models/dino_f16.gguf image.png cond.dinodata
   ```
 
 - **`.dinodata` loader** — `trellis2_load_dinodata()` still reads/writes the
@@ -303,8 +303,9 @@ latency, precision notes) is in [`models/MODEL_CARD.md`](models/MODEL_CARD.md).
 - **Stage-1 SS decoder** — `trellis2_ss_dec_decode()` runs the
   `SparseStructureDecoder` (a dense 3D-conv ResNet) that turns the z_s latent
   `[8,16³]` into an occupancy logit grid `[1,64³]`, upsampling 16→32→64 with two
-  `pixel_shuffle_3d` blocks. The coarse voxel scaffold is `logit > 0`. Runs fully
-  on the GPU (ggml `conv_3d_direct`, channel-LayerNorm, in-graph pixel-shuffle).
+  `pixel_shuffle_3d` blocks. The coarse voxel scaffold is `logit > 0`. The dense
+  CONV_3D has no CUDA/Vulkan kernel in bundled ggml, so this stage runs on the
+  CPU (only ~3 s of a 512 run).
   Validated against the real PyTorch decoder to **rel L2 5e-7 (f32) / 2e-5 (f16),
   100% sign agreement** on a sampled z_s. Run it:
 
@@ -462,6 +463,23 @@ model to remove the background before 3D reconstruction:
 # backends (CPU, CUDA, Vulkan).
 ```
 
+## Numerical alignment (CUDA / Vulkan vs CPU)
+
+Three backend precision traps were found and fixed so that CUDA and Vulkan
+outputs stay inside the flow-sampler's noise band of the CPU reference:
+
+| Trap | Root cause | Fix | Effect |
+|------|-----------|-----|--------|
+| **Vulkan fp16 accumulation** | ggml-vulkan picked an fp16-accumulate pipeline for F16×F32 matmuls | every `lin()` in trellis2.cpp forces `GGML_PREC_F32` | single-step SS-flow rel-L2 7.5e-3 → 5.5e-4; coarse mesh Δverts +58% → +0.8% |
+| **CUDA flash-attn K/V→F16** | `ggml_cuda_flash_attn_ext` unconditionally rounds F32 K/V to fp16 | `sdpa_auto()` uses an exact-softmax budget for small token counts (2 GiB score matrix), flash only for the huge HR attention | CUDA f32 single-step 5.6e-3 → 8e-4 (exact path) |
+| **cuBLAS TF32** | ggml-cuda enabled `CUBLAS_TF32_TENSOR_OP_MATH` globally (~10-bit mantissa) | build tree patches it to `CUBLAS_DEFAULT_MATH` | `test_slat` single step 8.2e-4 → 2.5e-6 |
+
+Measured 512-pipeline geometry parity vs CPU (same precision, steps=12,
+seed=42): coarse q8 within ±0.8%, 512 q8 within ±2.7%. The remaining spread is
+flow-Euler + CFG guidance (7.5×) chaotic amplification, not a single-operator
+bias. PBR texture stats across backends differ by <12% per channel. Full
+methodology and per-stage numbers: [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
 ## Q8 Quantization
 
 Models can be quantized from F16/F32 to Q8_0 (~8.5 bits/weight, ~50% size reduction)
@@ -535,7 +553,7 @@ at F16 due to precision requirements, not CUDA limitations.
 | `trellis2.cpp` | implementation                                         |
 | `convert_ss_flow_to_gguf.py` | stage-1 DiT checkpoint → GGUF converter  |
 | `convert_ss_dec_to_gguf.py`  | stage-1 decoder checkpoint → GGUF converter |
-| `mesh_export.{h,cpp}` | CUDA-free GLB export with direct vertex PBR or projected UV-atlas textures |
+| `mesh_export.{h,cpp}` | CUDA-free GLB export: decimate → unwrap → bake PBR atlas (xatlas opt-in; default chartless `simple_unwrap` for non-manifold meshes) |
 | `print_remesh.{h,cpp}` | optional CGAL Alpha Wrap reconstruction and closest-surface PBR transfer |
 | `quantize_to_q8.py` | F16/F32 → Q8_0 quantization tool (matches ggml reference) |
 | `examples/`    | CLI tools (`dino_info`, `ss_flow_info`, `ss_sample`, `ss_decode`, `ss_mesh`, `mesh2glb`) |

@@ -15,9 +15,12 @@ The Q8_0 implementation exactly matches ggml's quantize_row_q8_0_ref():
 
 CUDA compatibility note:
   The ggml CUDA backend now supports ggml_cpy for Q8_0→Q8_0 (added in this
-  project). However, precision-sensitive decoders (shape_dec, tex_dec,
-  shape_enc) must stay at F16 because sparse subdivision and UV decoding
-  are not robust to Q8 weight rounding.
+  project). However precision-sensitive VAE stages must stay at F16 —
+  experiment-confirmed 2026-08-30 (CUDA+Vulkan e2e, see docs/VERIFICATION.md):
+  shape_dec q8 -> level-0 subdivision collapse; tex_dec q8 -> saturated
+  material; shape_enc q8 -> sampler-amplified collapse. Also note ss_dec's
+  dense conv3d layout [3,3,3,N] fails the dims[0] % 32 check, so its q8
+  output is a byte clone of the f16 input.
 
 Usage:
     python quantize_to_q8.py models/ss_flow_f16.gguf models/ss_flow_q8.gguf

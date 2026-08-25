@@ -65,7 +65,7 @@ int main(int argc, char ** argv) {
     std::string models_dir = "models";
     std::string input, out_mesh, out_glb;
     std::string quality = "auto";
-    std::string quant = "q8";
+    std::string quant = "f16"; // default chain: cuda/vulkan f16 (q8 saves ~nothing now, only ss_dec quantizes)
     uint64_t seed = 0;
     int steps = 12;
     int texture_steps = 12;
@@ -107,7 +107,9 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::fprintf(stderr,
                 "usage: %s --models-dir DIR --input IMAGE --out-mesh OUT.t2mesh [--out-glb OUT.glb]\n"
-                "       [--quantization q8|f16]  model weight precision (default: q8)\n"
+                "       [--quantization q8|f16|f32]  model weight precision (default: f16;\n"
+                "       f32 upgrades the chaotic chain (dino/flows/ss_dec/shape_dec) to full-f32\n"
+                "       weights, texture chain stays f16 — the alignment/reference mode)\n"
                 "       [--quality auto|coarse|512|1024] [--seed N] [--steps N]\n"
                 "       [--texture-steps N] [--no-texture] [--save-grid OUT.t2grid]\n"
                 "       [--background auto|keep|black|white]\n"
@@ -125,14 +127,39 @@ int main(int argc, char ** argv) {
     }
 
     // Build model path: replace _f16 with _{quant} in filename.
-    // shape_dec, tex_dec, and shape_enc are precision-sensitive (sparse
-    // subdivision / UV decoding) and always use f16.
+    // Only weights feeding the chaotic CFG samplers (dino cond, all flow
+    // models) stay f16 in q8 mode: even Q8_0 cond error of ~7e-3 rel-L2 is
+    // amplified into completely different voxel sets. The three VAE stages
+    // are also experiment-confirmed f16-only (2026-08-30, CUDA+Vulkan e2e):
+    //   shape_dec q8 -> level-0 subdivision logits all flip negative
+    //     ("no children at level 0") — they live within ~Q8 weight noise
+    //     of zero; tex_dec q8 -> collapsed saturated PBR material;
+    //   shape_enc q8 -> its condition error is chaotically amplified by the
+    //     12-step texture sampler into the same saturated collapse.
+    // So q8 only ever applies to the post-sampling ss_dec (whose dense conv3d
+    // weight layout [3,3,3,N] is not Q8-blockable anyway — its q8 gguf is a
+    // byte clone of f16), i.e. q8 mode currently saves nothing here.
+    // f32 upgrades the chaotic chain to full-f32 weights for exact mode.
     auto p = [&](const char * name) -> std::string {
         std::string s = models_dir + "/" + name;
-        bool keep_f16 = (quant == "f16")
-            || (std::string(name).find("shape_dec") != std::string::npos)
-            || (std::string(name).find("tex_dec") != std::string::npos)
-            || (std::string(name).find("shape_enc") != std::string::npos);
+        const std::string n(name);
+        bool keep_f16;
+        if (quant == "f32") {
+            // texture chain has no f32 ggufs (its noise affects appearance,
+            // not the chaotic voxel set); the chaotic chain goes full f32.
+            keep_f16 = n.find("shape_enc") != std::string::npos
+                    || n.find("tex_dec") != std::string::npos
+                    || n.find("tex_slat_flow") != std::string::npos;
+        } else if (quant == "q8") {
+            keep_f16 = n.find("shape_dec") != std::string::npos
+                    || n.find("tex_dec") != std::string::npos
+                    || n.find("shape_enc") != std::string::npos
+                    || n.find("dino") != std::string::npos
+                    || n.find("ss_flow") != std::string::npos
+                    || n.find("slat_flow") != std::string::npos;
+        } else {
+            keep_f16 = true;
+        }
         if (!keep_f16) {
             std::string from = "_f16.gguf";
             std::string to = "_" + quant + ".gguf";
@@ -226,11 +253,16 @@ int main(int argc, char ** argv) {
 
     if (!out_glb.empty()) {
         int glen = 0;
+        int tex_size = 2048;
+        if (const char * ts = std::getenv("T2GLB_TEXTURE_SIZE")) {
+            int v = std::atoi(ts);
+            if (v >= 16 && v <= 8192) tex_size = v;
+        }
         uint8_t * glb = t2_bake_glb(
             t2_mesh_verts(mesh), t2_mesh_n_verts(mesh),
             t2_mesh_tris(mesh), t2_mesh_n_tris(mesh),
             t2_mesh_has_pbr(mesh) ? t2_mesh_pbr(mesh) : nullptr,
-            2048, 2, &glen, err, (int) sizeof err);
+            tex_size, 2, &glen, err, (int) sizeof err);
         if (!glb) {
             std::fprintf(stderr, "t2_bake_glb failed: %s\n", err[0] ? err : "(no message)");
             t2_mesh_free(mesh);

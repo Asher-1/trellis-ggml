@@ -4,3 +4,6 @@
 [submodule "third_party/RMBG-2.0-GGML"]
 	path = third_party/RMBG-2.0-GGML
 	url = https://github.com/Asher-1/RMBG-2.0-GGML.git
+[submodule "third_party/CuMesh"]
+	path = third_party/CuMesh
+	url = https://github.com/JeffreyXiang/CuMesh.git

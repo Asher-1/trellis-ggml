@@ -203,9 +203,12 @@ TRELLIS2_CAPI t2_mesh_result * t2_prepare_mesh(const float * verts, int n_verts,
 /* Optional CGAL Alpha Wrap print remeshing. Availability is fixed at build
 ** time. alpha_ratio and offset_ratio are fractions of the component-filtered
 ** input bounding-box diagonal (recommended starting point: 0.01 and
-** 0.01/30). The returned geometry is watertight, oriented, intersection-free,
-** 2-manifold, and geometry-only (no PBR) because wrapping creates new vertices.
-** Use t2_bake_projected_glb to transfer source PBR onto its UV atlas. */
+** 0.01/30). The returned geometry is watertight, oriented, intersection-free
+** and 2-manifold. Wrapping creates new vertices, so when the source carries
+** PBR it reaches the caller as a closest-surface projected per-vertex preview
+** (6 floats per vertex, aligned with the wrap vertices; empty for an
+** untextured source). Use t2_bake_projected_glb for the sharp per-texel
+** UV-atlas GLB transfer. */
 TRELLIS2_CAPI int t2_print_remesh_available(void);
 TRELLIS2_CAPI t2_mesh_result * t2_prepare_print_mesh(const float * verts, int n_verts,
                                                      const int * tris, int n_tris,

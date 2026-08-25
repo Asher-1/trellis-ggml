@@ -70,6 +70,17 @@ condition concatenation.
 > Params are approximated by summing GGUF tensor shapes. File sizes are the
 > decimal byte counts from `ls -l`.
 
+> **All ten `*_f16.gguf` runtime models are verified byte-identical
+> (SHA-256) to the upstream `LocalAI-io` HuggingFace releases**
+> (`TRELLIS.2-4B-GGUF` / `TRELLIS-image-large-GGUF` /
+> `dinov3-vitl16-pretrain-lvd1689m-GGUF`). They are produced by the same
+> `convert_*_to_gguf.py` scripts the upstream repo ships (deterministic
+> conversion), so local regeneration and the published artifacts match
+> exactly. Q8 variants (`*_q8.gguf`) and the RMBG models are local-only
+> additions with no HF counterpart. Re-check at any time with
+> `scripts/verify_hf_ggufs.sh` (compares SHA-256 against the HF API, no model
+> download needed).
+
 ### 2.2 Source weight directories
 
 | Directory | Content | Size | Purpose |
@@ -95,8 +106,10 @@ condition concatenation.
   conditioning tokens (1 CLS + 4 register + 1024 patch, taken from the last
   layer with affine LN removed) — the **visual condition** for all three DiT
   flows (SS-flow / shape-SLAT / tex-SLAT).
-- **Precision variants**: f16 (579 MB) / q8 (309 MB). Q8 quality loss is tiny;
-  recommended default.
+- **Precision variants**: f16 (579 MB) / q8 (309 MB). **f16 recommended** —
+  measured Q8 rel-L2 error on the conditioning output is ~7.3e-3 (30× the f16
+  error of 2.5e-4), which shifts downstream sampling visibly. Q8 is a
+  memory-constrained fallback only.
 - **Benchmark** (RTX 3060, CUDA): ~1s.
 - **Note**: conditioning tokens are concatenated with F32 tensors downstream,
   so token-related weights stay f32.
@@ -133,8 +146,9 @@ condition concatenation.
   **voxel scaffold** of the object.
 - **Benchmark** (RTX 3060, CUDA): ~19.8s — matches PyTorch CUDA 19.76s
   (diff <0.2%, proving ggml matmul performance parity).
-- **Precision variants**: f16 (2494 MB) / q8 (1353 MB). Q8 is essentially
-  lossless in speed; recommended.
+- **Precision variants**: f16 (2494 MB) / q8 (1353 MB). **f16 recommended** —
+  measured Q8 flow rel-L2 is 3.5e-2 vs f16 5.7e-3 (6× worse), too large for
+  reference-grade parity. Q8 is a memory-constrained fallback only.
 
 ### 3.4 SS decoder (sparse structure decoder) — `ss_dec_f16.gguf` / `ss_dec_q8.gguf`
 
@@ -217,46 +231,73 @@ condition concatenation.
 
 | Model | f16 | q8 | Recommended |
 |------|-----|-----|------|
-| dino | ✅ | ✅ | **q8** (309 MB, tiny quality loss) |
+| dino | ✅ | ✅ | **f16** (q8 cond rel-L2 7.3e-3, 30× f16) |
 | rmbg | ✅ | ✅ (not recommended) | **f16** (q8 saves nothing, breaks alpha gate) |
-| ss_flow | ✅ | ✅ | **q8** |
+| ss_flow | ✅ | ✅ | **f16** (q8 flow rel-L2 3.5e-2, 6× f16) |
 | ss_dec | ✅ | ⚠️ (same size) | f16/q8 both fine (q8 is not actually quantized) |
-| slat_flow / slat_flow_1024 | ✅ | ✅ | **q8** |
-| tex_slat_flow_512 / 1024 | ✅ | ✅ | **q8** |
+| slat_flow / slat_flow_1024 | ✅ | ✅ | **f16** (same q8 penalty as ss_flow) |
+| tex_slat_flow_512 / 1024 | ✅ | ✅ | **f16** (same q8 penalty as ss_flow) |
 | shape_dec / shape_enc / tex_dec | ✅ | ❌ | **f16 only** (precision-sensitive) |
 
-### 4.2 End-to-end results (RTX 3060 12GB)
+> **Q8 status**: kept as a memory-constrained fallback (~4 GB total instead of
+> ~16 GB), but **not reference-grade**: measured stage errors are 6–30× the f16
+> values, and end-to-end meshes deviate ~0.4% of bbox (mean) from f16 with
+> ~70% of vertices within 0.5% bbox. Precision-sensitive work must use f16.
 
-| Config | Model size | 12GB GPU | Inference time | Vertices |
-|------|---------|----------|----------|--------|
-| All f16 | ~16 GB | ❌ OOM | — | — |
-| **Q8 combo (recommended)** | ~4.3 GB | ✅ | **129.0s** (quality=512) | 1,824,032 (−3.2%) |
-| All f16 (reference) | ~16 GB | ❌ | 142.7s | 1,884,862 |
+### 4.2 End-to-end results (RTX 4090, T.png, seed 42, quality=512, steps=12)
 
-Q8 is ~10% faster than F16 (halved memory bandwidth), 73% smaller, with <3.5%
-geometric quality loss.
+| Config | Model size | Vertices | Note |
+|------|---------|----------|------|
+| CPU f16 | ~16 GB | 1,832,202 | F32 attention, closest to PyTorch |
+| CUDA f16 | ~16 GB | 1,832,202 | **bit-identical mesh to CPU f16** |
+| Vulkan f16 | ~16 GB | 1,817,307 | −0.8% verts; stage-level error is lowest of all backends |
+| CPU q8 | ~4.3 GB | 1,817,474 | −0.8% vs f16; mean vertex dev 0.42% bbox |
+
+F16 is the reference-grade configuration; Q8 trades ~0.4% bbox geometry for
+~4× less memory. Mesh vertex counts are threshold-sensitive (marching cubes),
+so small numerical differences between backends produce a few percent of
+vertex-count movement; the underlying geometry deviates only ~0.3% of bbox.
 
 ### 4.3 Parity verification
 
 Each GGUF has been verified tap-by-tap against the PyTorch reference (see
 [docs/VERIFICATION.md](../docs/VERIFICATION.md)):
 
-| Model | Test | Result |
-|------|------|------|
-| `dino_*` | `test_dino` (40 taps) | rel-L2 ≤ 7e-7 |
-| `ss_flow_*` | `test_ss_flow_forward` / `test_ss_sample` | 2.4e-4 / 5.7e-3 |
-| `ss_dec_*` | `test_ss_dec` | rel-L2 2e-5 |
-| `slat_flow_*` | `test_slat` | 2.9e-4 (CPU) / 8e-4 (GPU) |
-| `shape_dec` | `test_slat` (full 5-level chain) | rel-L2 ≤ 6e-7 |
-| `slat_flow_1024` | `test_cascade` | rel-L2 ~3e-4 (CPU) |
-| `tex_*` | texture/material regression | pass |
+| Model | Test | f32 model (CPU) | f16 model (CPU/CUDA/Vulkan) |
+|------|------|------|------|
+| `dino_*` | `test_dino` (40 taps) | rel-L2 ≤ 7e-7, 40/40 PASS | f16 quant error only: cond rel-L2 ~2.5e-4; CPU & CUDA identical tap-by-tap; Vulkan (F32×F32/F16×F32 base fp32 shaders) rel-L2 1.8e-4 |
+| `ss_flow_*` | `test_ss_flow_forward` / `test_ss_sample` | PASS | f16 quant error: 5.7e-3 / 4.5e-2; CPU==CUDA bit-identical |
+| `ss_dec_*` | `test_ss_dec` | PASS | 5.7e-5, PASS on all backends |
+| `slat_flow_*` | `test_slat` | PASS | CPU/CUDA identical; Vulkan flow rel-L2 3.4e-6 (best) |
+| `shape_dec` | `test_slat` (full 5-level chain) | PASS | — |
+| `slat_flow_1024` | `test_cascade` | PASS | CPU/CUDA identical |
+| `tex_*` | texture/material regression | — | SKIP (reference dump requires the docker container) |
+
+**Backend notes**
+
+- **CPU**: full FP32 computation; f32 validation models 40/40 PASS. This is the
+  reference backend for parity (closest to PyTorch).
+- **CUDA**: f16 deployment path is bit-identical to CPU end-to-end. The f32
+  validation models are NOT guaranteed on CUDA: upstream ggml keeps
+  `CUBLAS_TF32_TENSOR_OP_MATH`, which rounds F32×F32 GEMMs to TF32 (~4e-3 on
+  `embd`) — acceptable for f16/q8 deployment (their GEMMs are FP16/Q8 paths),
+  so the TF32 setting is left at upstream defaults.
+- **Vulkan**: `patches/ggml-vulkan-f32-matmul.patch` wires contiguous F32×F32,
+  F32×F16 and F16×F32 GEMMs to the base FP32 shaders (coopmat2 only ships fp16
+  shaders and would silently round F32 activations to fp16). This removes the
+  activation-rounding error other backends have, so Vulkan f16 stage errors are
+  the lowest of all backends; end-to-end it deviates ~0.3% bbox (mean) from
+  CPU/CUDA. F32 K/V flash attention already routes to the scalar FP32 shader in
+  upstream ggml, so attention needs no patch.
+- **Q8**: stage errors 6–30× f16 (quantization is lossy by design); keep for
+  memory-constrained runs only.
 
 ---
 
 ## 5. Acquisition & Regeneration
 
 ```bash
-# One-click download of prebuilt f16 GGUFs (into ggufs/)
+# One-click download of prebuilt f16 GGUFs (into models/)
 scripts/download_ggufs.sh
 
 # Download safetensors source weights (TRELLIS.2-4B / TRELLIS-image-large / dinov3-vitl16)

@@ -17,7 +17,7 @@ subdivision the tex decoder replays to rebuild the res-1024 voxel set.
     input_layer 6->64, to_latent 1024->2*32 (mean/logvar; we take mean).
 Conv weights are FlexGEMM [Co,kD,kH,kW,Ci] -> reshaped to [Co, kD*kH*kW, Ci].
 
-Usage: python convert_shape_enc_to_gguf.py --output ggufs/shape_enc_f16.gguf --ftype 1
+Usage: python convert_shape_enc_to_gguf.py --output models/shape_enc_f16.gguf --ftype 1
 """
 
 import argparse

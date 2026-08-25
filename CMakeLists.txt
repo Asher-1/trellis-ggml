@@ -151,8 +151,9 @@ else()
         endif()
     endif()
     _trellis_materialize_submodule(TRELLIS_GGML_MAPPED third_party/ggml
-        patches/ggml-cuda-cpy-q8_0.patch
-        patches/ggml-rmbg-ops.patch)
+        patches/ggml-trellis.patch
+        patches/ggml-rmbg-ops.patch
+        patches/ggml-vulkan-f32-route.patch)
     # The materialized tree has no .git: pass the real commit so ggml's
     # configure skips its git rev-parse (which would otherwise find the
     # parent repository) and reports the submodule commit correctly.
@@ -328,6 +329,28 @@ if(TRELLIS2_RMBG AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/RMBG-2.0-GG
     message(STATUS "RMBG-2.0 background removal: enabled")
 else()
     message(STATUS "RMBG-2.0 background removal: disabled")
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────
+# CuMesh GPU mesh processing (JeffreyXiang/CuMesh, MIT) — OPTIONAL
+#
+# GPU-accelerated chart clustering for UV atlas export. OFF by default: it
+# links libtorch internally (CUMESH_TORCH_DIR → TorchConfig.cmake) and the
+# end-to-end pipeline must run without any PyTorch runtime. The libtorch-free
+# default UV path is xatlas chart clustering (vendor'd, CPU). Enable CuMesh
+# only when a conda/libtorch installation is acceptable:
+#   cmake -DTRELLIS2_CUMESH=ON -DCUMESH_TORCH_DIR=/path/to/torch/share/cmake/Torch ..
+# ─────────────────────────────────────────────────────────────────────────
+option(TRELLIS2_CUMESH "Enable CuMesh GPU chart clustering (links libtorch)" OFF)
+if(TRELLIS2_CUMESH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/CuMesh/src/cumesh.h")
+    add_subdirectory(third_party/cumesh_glue)
+    target_include_directories(trellis2 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cumesh_glue)
+    target_link_libraries(trellis2 PRIVATE cumesh_glue)
+    target_compile_definitions(trellis2 PRIVATE TRELLIS2_HAVE_CUMESH=1)
+    message(STATUS "CuMesh GPU chart clustering: enabled")
+else()
+    message(STATUS "CuMesh GPU chart clustering: disabled")
 endif()
 
 set_property(TARGET trellis2 PROPERTY POSITION_INDEPENDENT_CODE ON)

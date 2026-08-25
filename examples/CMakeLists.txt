@@ -1,3 +1,19 @@
+# Example: run a single SS-flow DiT forward on supplied x/t/cond and dump
+# the velocity output for cross-backend numerics comparison.
+add_executable(t2_forward_probe t2_forward_probe.cpp)
+target_link_libraries(t2_forward_probe PRIVATE trellis2)
+target_compile_features(t2_forward_probe PRIVATE cxx_std_14)
+
+# Example: dump coarse-pipeline stage intermediates for cross-backend
+# numerical comparison (preprocess/DINO/SS-flow/SS-dec).
+add_executable(t2_stage_probe t2_stage_probe.cpp)
+target_link_libraries(t2_stage_probe PRIVATE trellis2)
+target_compile_features(t2_stage_probe PRIVATE cxx_std_14)
+
+add_executable(shape_dec_probe shape_dec_probe.cpp)
+target_link_libraries(shape_dec_probe PRIVATE trellis2)
+target_compile_features(shape_dec_probe PRIVATE cxx_std_14)
+
 # Example: inspect a .dinodata DINOv3 conditioning file.
 add_executable(dino_info dino_info.cpp)
 target_link_libraries(dino_info PRIVATE trellis2)

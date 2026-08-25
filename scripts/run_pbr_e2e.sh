@@ -9,6 +9,9 @@ MODELS="${MODELS:-$ROOT/models}"
 OUT="${OUT:-$ROOT/outputs/pbr_e2e}"
 INPUT="${INPUT:-$ROOT/assets/example_image/T.png}"
 QUALITY="${QUALITY:-512}"
+# Default inference chain (see .AGENTS.md): f16 weights, seed 0, 12 steps.
+QUANT="${QUANT:-f16}"
+SEED="${SEED:-0}"
 
 mkdir -p "$OUT"
 BIN="$BUILD/examples"
@@ -29,8 +32,8 @@ echo "== [1/2] image -> 3D + PBR (quality=$QUALITY) =="
   --out-mesh "$OUT/${PREFIX}.t2mesh" \
   --out-glb  "$OUT/${PREFIX}_e2e.glb" \
   --save-grid "$OUT/${PREFIX}.t2grid" \
-  --quality "$QUALITY" \
-  --seed 42 --steps 12 --texture-steps 12 \
+  --quality "$QUALITY" --quantization "$QUANT" \
+  --seed "$SEED" --steps 12 --texture-steps 12 \
   2>&1 | tee "$OUT/${PREFIX}_generate.log"
 
 echo ""
@@ -45,8 +48,8 @@ env TRELLIS2_DEVICE="$TEXTURE_DEVICE" \
   --input "$INPUT" \
   --out-mesh "$OUT/${PREFIX}_retexture.t2mesh" \
   --out-glb  "$OUT/${PREFIX}_retexture.glb" \
-  --quality "$QUALITY" \
-  --seed 42 --texture-steps 12 \
+  --quality "$QUALITY" --quantization "$QUANT" \
+  --seed "$SEED" --texture-steps 12 \
   2>&1 | tee "$OUT/${PREFIX}_texture.log"
 
 echo ""
@@ -58,8 +61,8 @@ env TRELLIS2_DEVICE="${TEXTURE_DEVICE:-cpu}" \
   --input "$INPUT" \
   --out-mesh "$OUT/${PREFIX}_qef_retexture.t2mesh" \
   --out-glb  "$OUT/${PREFIX}_qef_retexture.glb" \
-  --quality "$QUALITY" \
-  --seed 42 --texture-steps 12 \
+  --quality "$QUALITY" --quantization "$QUANT" \
+  --seed "$SEED" --texture-steps 12 \
   2>&1 | tee "$OUT/${PREFIX}_qef_texture.log"
 
 echo ""

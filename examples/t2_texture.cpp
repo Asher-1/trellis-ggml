@@ -52,7 +52,7 @@ int main(int argc, char ** argv) {
     std::string models_dir = "models";
     std::string mesh_path, grid_path, input, out_mesh, out_glb;
     std::string quality = "512";
-    std::string quant = "q8";
+    std::string quant = "f16"; // keep in sync with t2_generate default chain
     uint64_t seed = 0;
     int texture_steps = 12;
 
@@ -75,7 +75,7 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr,
                 "usage: %s --models-dir DIR --mesh M.t2mesh --input IMAGE --out-mesh OUT\n"
                 "       [--grid M.t2grid] [--out-glb OUT.glb] [--quality 512|1024]\n"
-                "       [--quantization q8|f16]  model weight precision (default: q8)\n"
+                "       [--quantization q8|f16]  model weight precision (default: f16)\n"
                 "       [--seed N] [--texture-steps N]\n"
                 "  omit --grid to run mesh->QEF->shape_enc (arbitrary mesh path)\n", argv[0]);
             return 0;
@@ -132,7 +132,17 @@ int main(int argc, char ** argv) {
 
     auto p = [&](const char * name) -> std::string {
         std::string s = models_dir + "/" + name;
+        // Match t2_generate's q8 policy: everything feeding the chaotic
+        // samplers (dino cond, flow models) plus the precision-sensitive VAE
+        // stages stays f16. The original list here omitted dino/flows, which
+        // would have quantized sampler weights — fixed 2026-08-30; the VAE
+        // skips are experiment-confirmed (see t2_generate.cpp q8 comment):
+        // shape_dec -> level-0 collapse, tex_dec -> saturated material,
+        // shape_enc -> sampler-amplified saturated material.
         bool keep_f16 = (quant == "f16")
+            || (std::string(name).find("dino") != std::string::npos)
+            || (std::string(name).find("ss_flow") != std::string::npos)
+            || (std::string(name).find("slat_flow") != std::string::npos)
             || (std::string(name).find("shape_dec") != std::string::npos)
             || (std::string(name).find("tex_dec") != std::string::npos)
             || (std::string(name).find("shape_enc") != std::string::npos);
@@ -187,10 +197,15 @@ int main(int argc, char ** argv) {
 
     if (!out_glb.empty()) {
         int glen = 0;
+        int tex_size = 2048;
+        if (const char * ts = std::getenv("T2GLB_TEXTURE_SIZE")) {
+            int v = std::atoi(ts);
+            if (v >= 16 && v <= 8192) tex_size = v;
+        }
         uint8_t * glb = t2_bake_glb(
             t2_mesh_verts(mesh), t2_mesh_n_verts(mesh),
             t2_mesh_tris(mesh), t2_mesh_n_tris(mesh),
-            t2_mesh_pbr(mesh), 2048, 2, &glen, err, (int) sizeof err);
+            t2_mesh_pbr(mesh), tex_size, 2, &glen, err, (int) sizeof err);
         if (!glb) {
             std::fprintf(stderr, "t2_bake_glb failed: %s\n", err[0] ? err : "(no message)");
             t2_mesh_free(mesh);

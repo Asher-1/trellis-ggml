@@ -6,13 +6,13 @@
 # direct pull of the ready-made f16 GGUFs. Developers who need the f32 validation
 # variants or want to regenerate GGUFs should still use those two scripts.
 #
-# Files land in $GGUFS (default: repo-root ggufs/). Already-present files are
+# Files land in $GGUFS (default: repo-root models/). Already-present files are
 # skipped, so re-runs are cheap and downloads resume (-C -). No auth needed
 # (public repos); HF_TOKEN is used if set.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GGUFS="${GGUFS:-$ROOT/ggufs}"
+GGUFS="${GGUFS:-$ROOT/models}"
 ORG="${GGUF_ORG:-LocalAI-io}"
 TOKEN="${HF_TOKEN:-}"
 AUTH=()

@@ -5,15 +5,18 @@
 // reference does this on the GPU (CuMesh simplify/unwrap/BVH, nvdiffrast
 // raster, flex_gemm grid_sample); here every stage is pure C++:
 //
-//   preserve topology -> optional decimation -> xatlas UV unwrap -> PBR atlas bake
-//   -> standard glTF baseColorTexture + metallicRoughnessTexture GLB.
-//   Set T2GLB_VERTEX to opt into the legacy per-vertex COLOR_0 export instead.
+//   preserve topology -> optional decimation -> UV unwrap (CuMesh GPU chart
+//   clustering if built with TRELLIS2_CUMESH, else chartless 6-bin projection;
+//   T2GLB_XATLAS opts into xatlas chart clustering — minutes-slow on large
+//   meshes) -> PBR atlas bake -> standard glTF baseColorTexture +
+//   metallicRoughnessTexture GLB.  Set T2GLB_VERTEX to opt into the legacy
+//   per-vertex COLOR_0 export instead.
 //
 // A practical fixed-size atlas cannot give millions of preserved triangles
 // enough texels, and the dual-grid geometry is heavily non-manifold. glTF vertex
-// colour is therefore both more faithful and substantially smaller. Set
-// T2GLB_XATLAS to opt into a conventional image atlas on clean meshes. No ggml /
-// CUDA dependency: plain float/int arrays.
+// colour is therefore both more faithful and substantially smaller. The UV
+// unwrap falls back to a chartless 6-bin projection when charting fails. No
+// ggml / CUDA / libtorch dependency in the default build: plain float/int arrays.
 
 #include <cstdint>
 #include <string>
